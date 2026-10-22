@@ -2368,10 +2368,9 @@ static int draw_prepare(unsigned prim) {
         if (p->push0) { if (nw) vkCmdPushDescriptorSetKHR(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, (uint32_t)nw, w); }
         else if (sets[0]) { vkUpdateDescriptorSets(V.device, (uint32_t)nw, w, 0, NULL); vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 1, &sets[0], 0, NULL); }
         if (p->nb[1]) {
-            uint64_t key = fnv(0xcbf29ce484222325ULL, &p->dl[1], sizeof p->dl[1]);
             int hit;
             TcEnt *tc;
-            key = fnv(key, g_dtex, sizeof g_dtex[0] * (size_t)g_ndtex);      /* views (and their ids), samplers, image layouts, binding numbers (one layout for every pipeline: they tell the lists apart) */
+            uint64_t key = hmix(0xcbf29ce484222325ULL ^ (uint64_t)(uintptr_t)p->dl[1], g_dtex, sizeof g_dtex[0] * (size_t)g_ndtex);      /* the layout, views (and their ids), samplers, image layouts, binding numbers (one layout for every pipeline: they tell the lists apart) */
             if (!key) key = 1;
             if (tc_on() && (tc = tc_get(key, p->dl[1], &hit)) != NULL) {      /* kept across command buffers */
                 if (hit) R.sets_reused++; else tset_write(tc->set);

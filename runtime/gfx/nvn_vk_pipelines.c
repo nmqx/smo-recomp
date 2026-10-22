@@ -82,7 +82,17 @@ static const char *ho_text(uint64_t hb) {
     for (int n = 0; n < 16; n++, i = (i + 1) & 65535) if (g_ho[i].hb == hb) { snprintf(b, sizeof b, "code first handed over at frame %d by nvnProgramSetShaders", g_ho[i].frame); return b; }
     return "code never handed over before this draw";
 }
-static uint64_t fnv(uint64_t h, const void *p, size_t n) { const uint8_t *b = p; for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001B3ULL; return h; }
+static uint64_t fnv(uint64_t h, const void *p, size_t n) { const uint8_t *b = p; for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001B3ULL; return h; }      /* byte-wise: names and records of the cache files (spv, stage, pipes.bin): never change it */
+/* Word-wise, for the tables in memory that are hashed at every draw (texture-set lists, pipeline keys, look-ahead tags):
+ * one multiply per 8 bytes instead of one per byte (fnv's chain of dependent multiplies), a byte loop for the tail, a final
+ * mix. Never for a value that names, or is stored in, a cache file. */
+static uint64_t hmix(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = p;
+    for (; n >= 8; n -= 8, b += 8) { uint64_t w; memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
+    for (; n; n--, b++) h = (h ^ *b) * 0x100000001B3ULL;
+    h ^= h >> 32; h *= 0xD6E8FEB86659FD93ull; h ^= h >> 32;      /* every bit into the low ones (the tables index by them) */
+    return h;
+}
 /* the cache folder. SMO_VK_CACHE=<folder> (tests: a first run on a cache of one's own, without touching the
  * shared ..\cache\vk); first called on the starting thread, before the workers exist. */
 static const char *vkc_dir(void) {
@@ -396,6 +406,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo, int 
 
 /* ---------------------------------------------------------------- pipelines */
 typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8]; } PKey;
+static uint64_t pkey_hash(const PKey *k) { return hmix(0xcbf29ce484222325ULL, k, sizeof *k); }      /* the table of pipelines (g_pipes, in memory only) */
 typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs, *gs /* see gs_pipe_get */; volatile LONG state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
 static Pipe *g_pipes[1024];
 static VkShaderModule g_gs_dbg_fs;                 /* SMO_VK_GS_DEBUG=3 (gs_pipe_get): the fragment stage of draws with a geometry stage */
@@ -958,7 +969,7 @@ static void predict_pair(PairRec *pr, int i) {
     if (pr->drawn || pr->npred >= 3 || (pr->sigs >> i & 1)) return;
     PKey k = g_sig[i].k;
     k.vs = pr->vs->id; k.fs = pr->fs ? pr->fs->id : 0; k.sshade = pr->fs ? pr->sshade : 0;
-    uint64_t h = fnv(0xcbf29ce484222325ULL, &k, sizeof k);
+    uint64_t h = pkey_hash(&k);
     pr->sigs |= 1ull << i;
     if (pipe_find(&k, h)) return;
     pr->npred++;
@@ -989,7 +1000,7 @@ static Pipe *pipe_get(const PKey *k, VStage *vs, VStage *fs) {
     return p;
 }
 static Pipe *pipe_get2(const PKey *k, VStage *vs, VStage *fs) {
-    uint64_t h = fnv(0xcbf29ce484222325ULL, k, sizeof *k);
+    uint64_t h = pkey_hash(k);
     int mine = 0, waited = 0;
     LONG64 t0 = 0;
     EnterCriticalSection(&g_sh_lock);
@@ -1278,7 +1289,7 @@ static void job_draw(Job *j) {                     /* a draw the look-ahead met 
     if (!D.has_eds3) return;                       /* the key holds blend state the look-ahead does not follow */
     PKey k = j->k;
     k.vs = vs->id; k.fs = fs ? fs->id : 0;
-    uint64_t h = fnv(0xcbf29ce484222325ULL, &k, sizeof k);
+    uint64_t h = pkey_hash(&k);
     int mine = 0;
     EnterCriticalSection(&g_sh_lock);
     Pipe *p = pipe_find(&k, h);
@@ -1300,7 +1311,7 @@ static DWORD WINAPI pw_main(void *arg) {
         Pipe *p = NULL;
         if (vs && !r->compute && (!r->fs_h || fs)) {
             r->k.vs = vs->id; r->k.fs = fs ? fs->id : 0;
-            uint64_t h = fnv(0xcbf29ce484222325ULL, &r->k, sizeof r->k);
+            uint64_t h = pkey_hash(&r->k);
             if (!pipe_find(&r->k, h)) { p = pipe_new(&r->k, vs, fs, h, 1); p->recorded = 1; }
             int idx;
             sig_note(&r->k, &idx);
@@ -1549,7 +1560,7 @@ static void scan_draw(Scan *s, unsigned prim) {
     }
     uint64_t w[6] = {(uint64_t)(uintptr_t)p0->st[0].code ^ ((uint64_t)p0->serial << 44), p1 ? (uint64_t)(uintptr_t)p1->st[1].code ^ ((uint64_t)p1->serial << 44) : 0, s->sig_tag, tclass[prim] | (uint64_t)s->logic << 8 | (uint64_t)(p1 ? p1->sample_shading & 1 : 0) << 16,
                      (uint64_t)s->ints << 32 | s->sints, (uint64_t)g_scan_ti[0] << 32 | g_scan_ti[1]};
-    uint64_t tag = fnv(0xcbf29ce484222325ULL, w, sizeof w) | 1;
+    uint64_t tag = hmix(0xcbf29ce484222325ULL, w, sizeof w) | 1;
     unsigned slot = (unsigned)(tag >> 20) & 8191;
     if (g_scan_seen[slot] == tag) return;
     g_scan_seen[slot] = tag;
@@ -1562,7 +1573,7 @@ static void scan_draw(Scan *s, unsigned prim) {
     if (vs_made && fs_made) {
         if (!vs->ok || (fs && !fs->ok)) return;
         k.vs = vs->id; k.fs = fs ? fs->id : 0;
-        uint64_t h = fnv(0xcbf29ce484222325ULL, &k, sizeof k);
+        uint64_t h = pkey_hash(&k);
         EnterCriticalSection(&g_sh_lock);
         Pipe *pf = pipe_find(&k, h);
         if (!pf || pf->state == 0) {               /* not there, or waiting in the background queue: to the front */
