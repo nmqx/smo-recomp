@@ -92,3 +92,29 @@ Target: the render thread under 12 ms a frame in the city, which with the asynch
   it); pipe_get (lock + byte-wise FNV + 128-byte memcmp chains: a direct-mapped Pipe* cache in front); word-wise hashes
   for the texture-set key and scan tag; skip vkCmdSetVertexInputEXT / topology / dynamic state calls that repeat the
   last values; passshot_frame() once per batch; index_max cache 2048 -> 16384.
+
+## Next steps (2026-10-23)
+
+State: New Donk City streets 17.9 ms a frame (about 56 fps), render thread replay about 12.7 ms (draw preparation 7.1).
+60 fps needs 16.7 ms: about 1.2 ms more, plus a margin. Local branch has the four micro-optimizations of the worktree
+agent cherry-picked (eb13d4f texture sets across command buffers, a088a83 index_max, 75c5a60 passshot flag, 8981476
+word-wise hashes): push only after `tests\run_cap_kingdom.py capk_ag` PASSES (log build\run\capk_ag.log).
+
+1. **Drops on entering the city** (frames 1200-1500 after the first play frame: p99 63 ms, max 218 ms; no pipeline
+   holds). A hitch trace was started: `build\run\entry.log` (SMO_HITCH=40, SMO_VK_HOLDLOG=1). Read its `hitch: frame`
+   lines and `nvn_vk_upl` lines: textures made or read at their first use (vt_get uploads on the render thread) are the
+   first suspect; then page faults (heap growth) and the game's own loading threads. Fixes by cause: make textures ahead
+   further (tex_ahead) or upload them from a worker into a transfer queue; pre-touch / pre-commit the guest heap.
+2. **Occlusion wait at the present** (~1 ms a frame): measure `--env SMO_VK_OCC_PRESENT=0` (2 runs of city_short.seq);
+   if no visible popping, make it the default.
+3. **No ring copies of guest memory** (~22 MB a frame, 2-3 ms): VK_EXT_external_memory_host (the device has it):
+   import the guest heap (one fixed reservation; alignment minImportedHostPointerAlignment) as host memory and make
+   buffers over it; buf_ref() then binds the imported buffer at the guest offset when the range is not in a live CB, was
+   not written by the host during the batch (host_wrote log) and meets the offset alignment of its use (storage:
+   minStorageBufferOffsetAlignment); otherwise the ring as today. The GPU reads guest memory when it runs, which the
+   game's fence contract allows (nvn_gl.c comment above gl_post). Behind SMO_VK_HOSTMEM=1 until checked with
+   run_cap_kingdom.py and pictures compared with tools\dev\drawdiff.py.
+4. **resolve_sampler cache** (~1-1.5 ms): cache (pool, handle) -> (VTex, view, sampler) per batch, dropped when the game
+   writes the texture or sampler pool (host write log / texhash of the pool range).
+5. Later: helper threads on the idle second hardware threads of the game's cores (CPUs 6, 8, 10) instead of the
+   runtime's three cores; a newer clang with PGO for the runtime and the lifted code.

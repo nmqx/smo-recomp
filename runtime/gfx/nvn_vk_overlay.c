@@ -5,7 +5,7 @@
  * command buffer: no shader, no pass. A ring of buffers so that a copy still in flight is never written. */
 
 #define OV_SCALE 3
-#define OV_W 300
+#define OV_W 360
 #define OV_H 31
 #define OV_RING 8
 static struct { int on, made, i; VkBuffer buf[OV_RING]; VMem mem[OV_RING]; volatile LONG64 game, shown; LONG64 t0, g0, s0; int fps_game, fps_shown; } OV;
