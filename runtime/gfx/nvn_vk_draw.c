@@ -251,6 +251,7 @@ static struct {
 } R;
 
 static void pass_shot(void);
+static int g_dyn_inval = 1;                        /* set_dynamic_state's record of the states sent is stale (a new command buffer, states set by our own draws) */
 /* debug aid SMO_VK_FRAMELOG=<first>-<last>: one line per frame of that range: draws, draws left out (and how many of
  * them because rendering was switched off), conditional render switches (and how many switched rendering off), render
  * passes, and a hash of the conditional results in order, to find frames that differ from their neighbours. */
@@ -364,7 +365,7 @@ static void cmd_begin(void) {
     VKC(vkResetCommandBuffer(s->cmd, 0));
     VKC(vkBeginCommandBuffer(s->cmd, &bi));
     s->rlap0 = R.ring_lap; s->rpos0 = R.ring_pos;
-    R.cmd = s->cmd; R.recording = 1; R.in_pass = 0; R.pipe_bound = NULL; R.dyn_dirty = R.vi_dirty = 1;
+    R.cmd = s->cmd; R.recording = 1; R.in_pass = 0; R.pipe_bound = NULL; R.dyn_dirty = R.vi_dirty = 1; g_dyn_inval = 1;
     if (g_ts_on < 0) {
         g_ts_on = getenv("SMO_VK_GPUTIME") && atoi(getenv("SMO_VK_GPUTIME")) && V.props.limits.timestampComputeAndGraphics;
         if (g_ts_on) { VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = NSLOT * 2; VKC(vkCreateQueryPool(V.device, &qi, NULL, &g_ts_pool)); }
@@ -1408,47 +1409,63 @@ static void rs_rect(int *x, int *y, int *w, int *h) {
     int x1 = (int)ceilf((float)(*x + *w) * R.pass_sx - 0.001f), y1 = (int)ceilf((float)(*y + *h) * R.pass_sy - 0.001f);
     *x = x0; *y = y0; *w = x1 > x0 ? x1 - x0 : 0; *h = y1 > y0 ? y1 - y0 : 0;
 }
+/* the dynamic state last set in the command buffer being recorded: set_dynamic_state sends only what changed (the game
+ * changes one state between draws, and every vkCmdSet* used to go to the driver each time: about 20 calls a draw) */
+static struct { VkViewport vp; VkRect2D sc; float lw, bias[3], bc[4]; uint32_t cm[2], wm[2], ref[2], cull, ff, dte, dwe, dcmp, ste, sop[2][4], dbe, rd; } g_dl;
+static int g_dl_valid;
+#define DYNSET(field, value, call) do { if (!g_dl_valid || memcmp(&g_dl.field, &(value), sizeof g_dl.field)) { memcpy(&g_dl.field, &(value), sizeof g_dl.field); call; } } while (0)
 static void set_dynamic_state(void) {
     VkViewport vp;
     VkRect2D sc;
     uint64_t d = R.ds;
+    if (g_dyn_inval) { g_dl_valid = 0; g_dyn_inval = 0; }
+    memset(&vp, 0, sizeof vp); memset(&sc, 0, sizeof sc);
     float x = R.have_viewport ? R.viewport[0] : 0, y = R.have_viewport ? R.viewport[1] : 0, w = R.have_viewport ? R.viewport[2] : (float)R.pass_w, h = R.have_viewport ? R.viewport[3] : (float)R.pass_h;
     if (R.pass_rs && R.have_viewport) { x *= R.pass_sx; w *= R.pass_sx; y *= R.pass_sy; h *= R.pass_sy; }      /* the game's rectangle on the scaled image */
     vp.x = x; vp.y = y + h; vp.width = w; vp.height = -h; vp.minDepth = R.drange[0]; vp.maxDepth = R.drange[1];      /* NVN upper-left origin: clip y = +1 is row y (design, section 3) */
     if (vp.minDepth < 0) vp.minDepth = 0; if (vp.maxDepth > 1) vp.maxDepth = 1;
-    vkCmdSetViewport(R.cmd, 0, 1, &vp);
+    DYNSET(vp, vp, vkCmdSetViewport(R.cmd, 0, 1, &vp));
     int sx = R.have_scissor ? R.scissor[0] : 0, sy = R.have_scissor ? R.scissor[1] : 0, sw = R.have_scissor ? R.scissor[2] : R.pass_w, sh = R.have_scissor ? R.scissor[3] : R.pass_h;
     if (R.pass_rs && R.have_scissor) rs_rect(&sx, &sy, &sw, &sh);
     if (sx < 0) { sw += sx; sx = 0; } if (sy < 0) { sh += sy; sy = 0; }
     if (sx > R.pass_w) sx = R.pass_w; if (sy > R.pass_h) sy = R.pass_h;
     if (sw > R.pass_w - sx) sw = R.pass_w - sx; if (sh > R.pass_h - sy) sh = R.pass_h - sy;
     sc.offset.x = sx; sc.offset.y = sy; sc.extent.width = (uint32_t)(sw > 0 ? sw : 0); sc.extent.height = (uint32_t)(sh > 0 ? sh : 0);
-    vkCmdSetScissor(R.cmd, 0, 1, &sc);
-    if (R.pass_rs && D.f2.features.wideLines) { float lw = R.line_width * R.pass_sx; vkCmdSetLineWidth(R.cmd, lw < V.props.limits.lineWidthRange[0] ? V.props.limits.lineWidthRange[0] : lw); } else
-    vkCmdSetLineWidth(R.cmd, D.f2.features.wideLines ? R.line_width : 1.0f);
-    vkCmdSetDepthBias(R.cmd, R.polyoff[1], D.f2.features.depthBiasClamp ? R.polyoff[2] : 0.0f, R.polyoff[0]);
-    vkCmdSetBlendConstants(R.cmd, R.blendc);
-    vkCmdSetStencilCompareMask(R.cmd, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)R.svmask[0]); vkCmdSetStencilCompareMask(R.cmd, VK_STENCIL_FACE_BACK_BIT, (uint32_t)R.svmask[1]);
-    vkCmdSetStencilWriteMask(R.cmd, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)R.swmask[0]); vkCmdSetStencilWriteMask(R.cmd, VK_STENCIL_FACE_BACK_BIT, (uint32_t)R.swmask[1]);
-    vkCmdSetStencilReference(R.cmd, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)R.sref[0]); vkCmdSetStencilReference(R.cmd, VK_STENCIL_FACE_BACK_BIT, (uint32_t)R.sref[1]);
+    DYNSET(sc, sc, vkCmdSetScissor(R.cmd, 0, 1, &sc));
+    {   float lw = R.pass_rs && D.f2.features.wideLines ? R.line_width * R.pass_sx : D.f2.features.wideLines ? R.line_width : 1.0f;
+        if (R.pass_rs && D.f2.features.wideLines && lw < V.props.limits.lineWidthRange[0]) lw = V.props.limits.lineWidthRange[0];
+        DYNSET(lw, lw, vkCmdSetLineWidth(R.cmd, lw));
+    }
+    {   float bias[3] = {R.polyoff[1], D.f2.features.depthBiasClamp ? R.polyoff[2] : 0.0f, R.polyoff[0]};
+        DYNSET(bias, bias, vkCmdSetDepthBias(R.cmd, bias[0], bias[1], bias[2]));
+    }
+    {   float bc[4]; memcpy(bc, R.blendc, sizeof bc); DYNSET(bc, bc, vkCmdSetBlendConstants(R.cmd, bc)); }
+    {   uint32_t cm[2] = {(uint32_t)R.svmask[0], (uint32_t)R.svmask[1]}, wm[2] = {(uint32_t)R.swmask[0], (uint32_t)R.swmask[1]}, ref[2] = {(uint32_t)R.sref[0], (uint32_t)R.sref[1]};
+        DYNSET(cm, cm, (vkCmdSetStencilCompareMask(R.cmd, VK_STENCIL_FACE_FRONT_BIT, cm[0]), vkCmdSetStencilCompareMask(R.cmd, VK_STENCIL_FACE_BACK_BIT, cm[1])));
+        DYNSET(wm, wm, (vkCmdSetStencilWriteMask(R.cmd, VK_STENCIL_FACE_FRONT_BIT, wm[0]), vkCmdSetStencilWriteMask(R.cmd, VK_STENCIL_FACE_BACK_BIT, wm[1])));
+        DYNSET(ref, ref, (vkCmdSetStencilReference(R.cmd, VK_STENCIL_FACE_FRONT_BIT, ref[0]), vkCmdSetStencilReference(R.cmd, VK_STENCIL_FACE_BACK_BIT, ref[1])));
+    }
     { static int nocull = -1; if (nocull < 0) nocull = getenv("SMO_VK_DIAG_NOCULL") != NULL;      /* diagnosis only */
-      vkCmdSetCullMode(R.cmd, nocull ? 0 : (R.poly[0] & 3)); }
-    vkCmdSetFrontFace(R.cmd, R.poly[1] ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
+      uint32_t cull = nocull ? 0 : (R.poly[0] & 3); DYNSET(cull, cull, vkCmdSetCullMode(R.cmd, cull)); }
+    { uint32_t ff = R.poly[1] ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE; DYNSET(ff, ff, vkCmdSetFrontFace(R.cmd, (VkFrontFace)ff)); }
     { static int nodepth = -1; if (nodepth < 0) nodepth = getenv("SMO_VK_DIAG_NODEPTH") != NULL;      /* diagnosis only */
-      vkCmdSetDepthTestEnable(R.cmd, nodepth ? 0 : (d & 1)); vkCmdSetDepthWriteEnable(R.cmd, (d >> 1) & 1); }
-    { unsigned f = (unsigned)(d >> 4) & 15; vkCmdSetDepthCompareOp(R.cmd, (VkCompareOp)(f >= 1 && f <= 8 ? f - 1 : 7)); }
-    vkCmdSetStencilTestEnable(R.cmd, (d >> 2) & 1);
+      uint32_t dte = nodepth ? 0 : (uint32_t)(d & 1), dwe = (uint32_t)((d >> 1) & 1);
+      DYNSET(dte, dte, vkCmdSetDepthTestEnable(R.cmd, dte)); DYNSET(dwe, dwe, vkCmdSetDepthWriteEnable(R.cmd, dwe)); }
+    { unsigned f = (unsigned)(d >> 4) & 15; uint32_t dcmp = f >= 1 && f <= 8 ? f - 1 : 7; DYNSET(dcmp, dcmp, vkCmdSetDepthCompareOp(R.cmd, (VkCompareOp)dcmp)); }
+    { uint32_t ste = (uint32_t)((d >> 2) & 1); DYNSET(ste, ste, vkCmdSetStencilTestEnable(R.cmd, ste)); }
     {   static const uint8_t op[9] = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_ZERO, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_INCREMENT_AND_CLAMP, VK_STENCIL_OP_DECREMENT_AND_CLAMP, VK_STENCIL_OP_INVERT,
                                       VK_STENCIL_OP_INCREMENT_AND_WRAP, VK_STENCIL_OP_DECREMENT_AND_WRAP};
 #define SOP(sh) ((VkStencilOp)op[((d >> (sh)) & 15) < 9 ? ((d >> (sh)) & 15) : 1])
 #define SFN(sh) ((VkCompareOp)((((d >> (sh)) & 15) >= 1 && ((d >> (sh)) & 15) <= 8) ? ((d >> (sh)) & 15) - 1 : 7))
-        vkCmdSetStencilOp(R.cmd, VK_STENCIL_FACE_FRONT_BIT, SOP(16), SOP(24), SOP(20), SFN(8));       /* (fail, pass, depth fail, compare); NVN order: stencil fail, depth fail, depth pass */
-        vkCmdSetStencilOp(R.cmd, VK_STENCIL_FACE_BACK_BIT, SOP(28), SOP(36), SOP(32), SFN(12));
+        uint32_t sop[2][4] = {{SOP(16), SOP(24), SOP(20), SFN(8)}, {SOP(28), SOP(36), SOP(32), SFN(12)}};      /* (fail, pass, depth fail, compare); NVN order: stencil fail, depth fail, depth pass */
+        DYNSET(sop, sop, (vkCmdSetStencilOp(R.cmd, VK_STENCIL_FACE_FRONT_BIT, (VkStencilOp)sop[0][0], (VkStencilOp)sop[0][1], (VkStencilOp)sop[0][2], (VkCompareOp)sop[0][3]),
+                          vkCmdSetStencilOp(R.cmd, VK_STENCIL_FACE_BACK_BIT, (VkStencilOp)sop[1][0], (VkStencilOp)sop[1][1], (VkStencilOp)sop[1][2], (VkCompareOp)sop[1][3])));
 #undef SOP
 #undef SFN
     }
-    vkCmdSetDepthBiasEnable(R.cmd, (R.poly[3] >> (R.poly[2] < 3 ? R.poly[2] : 2)) & 1);          /* offset enable bits: point, line, fill; the polygon mode picks one */
-    vkCmdSetRasterizerDiscardEnable(R.cmd, R.rast_discard);
+    { uint32_t dbe = (uint32_t)((R.poly[3] >> (R.poly[2] < 3 ? R.poly[2] : 2)) & 1); DYNSET(dbe, dbe, vkCmdSetDepthBiasEnable(R.cmd, dbe)); }      /* offset enable bits: point, line, fill; the polygon mode picks one */
+    { uint32_t rd = (uint32_t)R.rast_discard; DYNSET(rd, rd, vkCmdSetRasterizerDiscardEnable(R.cmd, rd)); }
+    { static int all = -1; if (all < 0) all = getenv("SMO_VK_DYN_ALL") && atoi(getenv("SMO_VK_DYN_ALL")); g_dl_valid = !all; }      /* SMO_VK_DYN_ALL=1: every state at every set, as before */
 }
 static int have_targets_live(void) { return R.in_pass || R.have_targets; }
 /* the state that left the pipeline key (VK_EXT_extended_dynamic_state3). Set after a pipeline is bound, whenever
@@ -2172,7 +2189,7 @@ static int draw_prepare(unsigned prim) {
     if (R.pipe_bound != p) { vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->p); R.pipe_bound = p; }
     if (R.dyn_dirty) { set_dynamic_state(); R.dyn_dirty = 0; }
     if (D.has_eds3 && (R.dyn3_dirty || R.dyn3_samples != k.samples)) { set_dynamic_state3(k.samples); R.dyn3_dirty = 0; }
-    if (gs && g_gs_dbg_fs) { vkCmdSetDepthTestEnable(R.cmd, VK_FALSE); R.dyn_dirty = 1; }      /* SMO_VK_GS_DEBUG=3 (gs_pipe_get) */
+    if (gs && g_gs_dbg_fs) { vkCmdSetDepthTestEnable(R.cmd, VK_FALSE); R.dyn_dirty = 1; g_dyn_inval = 1; }      /* SMO_VK_GS_DEBUG=3 (gs_pipe_get) */
     vkCmdSetPrimitiveTopology(R.cmd, (VkPrimitiveTopology)topo[prim]);
     vkCmdSetPrimitiveRestartEnable(R.cmd, R.restart && (D.has_plr || prim == 3 || prim == 5 || prim == 6));
     /* 4. vertex input */
@@ -2352,7 +2369,7 @@ static void stencil_clear_masked(uint32_t mask, uint32_t value, int sx, int sy, 
     vkCmdSetVertexInputEXT(R.cmd, 0, NULL, 0, NULL);
     R.vi_dirty = 1;                                /* the next draw sets its own vertex input again */
     vkCmdDraw(R.cmd, 3, 1, 0, 0);
-    R.pipe_bound = NULL; R.dyn_dirty = 1;
+    R.pipe_bound = NULL; R.dyn_dirty = 1; g_dyn_inval = 1;      /* the states set above are not those set_dynamic_state last sent */
 }
 
 /* ---------------------------------------------------------------- copies */
@@ -2942,8 +2959,12 @@ static void vk_submit(void *arg) {
     nvn_front_batch_begin();
     GEN_BUMP(GEN_BATCH);                           /* guest memory may have changed since the last batch */
     g_batch_no++;
-    if (g_scan_on) { LONG64 ts = tk(); Scan s; scan_begin(&s); for (int i = 0; i < j->count; i++) scan_list(j->handles[i], 0, &s); g_tm[9] += tk() - ts; }      /* what this batch will need goes to the workers before it is replayed */
+    if (g_scan_on) {                               /* what this batch will need goes to the workers before it is replayed */
+        if (mt_on()) scan_async_start(j->handles, j->count);      /* SMO_VK_MT=1: beside the replay, on its own thread */
+        else { LONG64 ts = tk(); Scan s; scan_begin(&s); for (int i = 0; i < j->count; i++) scan_list(j->handles[i], 0, &s); g_tm[9] += tk() - ts; }
+    }
     for (int i = 0; i < j->count; i++) replay(j->handles[i], 0);
+    scan_async_wait();
     cb_batch_end();
     occ_fold();
     g_tm[7] += t1 - t0; g_tm[3] += tk() - t1;
@@ -2955,11 +2976,15 @@ static void vk_housekeeping(void *arg) { (void)arg; if (V.alive) nvn_front_take_
 static void vk_flush(void *arg) { (void)arg; if (V.alive) cmd_submit(NULL, NULL); }
 static void vk_finish(void *arg) { (void)arg; if (V.alive) { cmd_wait_all(); if (g_occ_qn) occ_resolve(0); } }
 static void vk_fence(void *arg) { SyncJob *j = arg; if (j->o->dead || !V.alive) return; j->o->s = (void *)(uintptr_t)(cmd_submit(NULL, NULL) + 1); }
+/* A fence the GPU has passed may still cover compute results not yet copied back to guest memory: R.done also moves on
+ * through waits that do not land them (the occlusion wait at the present, slot_wait in cmd_begin). The game reads what the
+ * fence covers as soon as the wait returns, so what has finished is landed first (cb_poll never waits). */
+static LONG64 g_sync_pending_cb;
 static void vk_sync_wait_(SyncJob *j) {
     uint64_t want = (uint64_t)(uintptr_t)j->o->s;
     if (!want || !V.alive) { j->result = 3; return; }       /* never fenced */
     want--;
-    if (want <= R.done) { j->result = 0; return; }
+    if (want <= R.done) { if (g_cb_pending && g_cb_serial <= want) g_sync_pending_cb++; cb_poll(); j->result = 0; return; }
     for (int i = 0; i < NSLOT; i++) {
         Slot *s = &R.slot[i];
         if (!s->pending || s->serial != want) continue;
@@ -2967,6 +2992,7 @@ static void vk_sync_wait_(SyncJob *j) {
         if (r == VK_SUCCESS) { if (s->serial > R.done) R.done = s->serial; j->result = 1; cb_poll(); } else j->result = r == VK_TIMEOUT ? 2 : 3;
         return;
     }
+    cb_poll();
     j->result = 0;                                  /* its command buffer was reused: finished long ago */
 }
 static void vk_sync_wait(void *arg) { vk_sync_wait_(arg); if (V.alive && g_occ_qn) occ_resolve(0); }      /* occlusion counts the fence covers are in guest memory when the game goes on */
@@ -3102,7 +3128,8 @@ static void pass_shot(void) {
         printf("nvn_vk_pass: pass %d: alpha (top two bits) histogram 0:%lld 1:%lld 2:%lld 3:%lld\n", n, alpha_hist[0], alpha_hist[1], alpha_hist[2], alpha_hist[3]);
         uint32_t row = ((uint32_t)w * 3 + 3) & ~3u, size = 54 + row * (uint32_t)h, v;
         char path[300];
-        const char *dir = getenv("SMO_SHOT_DIR");
+        const char *dir = getenv("SMO_SHOT_DIR") ? getenv("SMO_SHOT_DIR") : g_ps_key ? "../passshots" : NULL;      /* the Capture button's pictures: build/passshots */
+        if (g_ps_key && !getenv("SMO_SHOT_DIR")) CreateDirectoryA("../passshots", NULL);
         snprintf(path, sizeof path, "%s%spass_%s%03d_%02x.bmp", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)t->b.format);
         FILE *f = fopen(path, "wb");
         uint8_t head[54] = {'B', 'M'}, *rowb = calloc(1, row);
@@ -3363,7 +3390,7 @@ static void vk_present2(void *arg, int progress) {
     if (vt && g_capture_req && InterlockedExchange(&g_capture_req, 0)) {      /* the Capture button */
         capture_vk(vt);
         if (g_ps_lo == -2) passshot_parse();
-        if ((g_ps_lo < 0 || g_ps_key) && getenv("SMO_VK_PASSSHOT_KEY")) {     /* debug aid: the next frame's render passes as pictures (pass_shot), to find the pass that goes wrong */
+        if ((g_ps_lo < 0 || g_ps_key) && !(getenv("SMO_VK_PASSSHOT_KEY") && !atoi(getenv("SMO_VK_PASSSHOT_KEY")))) {     /* debug aid: the next frame's render passes as pictures (pass_shot), to find the pass that goes wrong */
             g_ps_lo = g_ps_hi = frame + 1; g_ps_key = 1;
             printf("nvn_vk_pass: the Capture button: frame %lld's render passes are saved (SMO_VK_PASSSHOT_KEY)\n", (long long)frame + 1);
         }
@@ -3502,6 +3529,7 @@ shown:
                (double)(g_tm[0] - last[0]) * k, (double)(g_tm[1] - last[1]) * k, (double)(g_tm[7] - last[7]) * k, (double)(g_tm[4] - last[4]) * k, (double)(R.dispatches - last_disp) / 300.0, (double)(R.sets - last_sets) / 300.0, (double)(R.sets_reused - last_reused) / 300.0, (double)(R.flushes - last_flush) / 300.0, (long long)g_pipe_miss,
                (long long)(g_hold_n[0] + g_hold_n[1] + g_hold_n[2] + g_hold_n[3]), (double)(g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3]) * k * 300.0, (double)g_hold_max * k * 300.0);
         if (g_gs_draws) printf("nvn_vk_gs: frames %lld..%lld: draws with a geometry stage so far %lld, their pipelines %lld\n", (long long)frame - 300, (long long)frame, (long long)g_gs_draws, (long long)g_gs_pipes);
+        { static LONG64 sp_last; if (g_sync_pending_cb != sp_last) printf("nvn_vk_sync: frames %lld..%lld: %lld fence waits found compute results not yet in guest memory (landed before returning)\n", (long long)frame - 300, (long long)frame, (long long)(g_sync_pending_cb - sp_last)); sp_last = g_sync_pending_cb; }
         { static LONG64 vs_last; printf("nvn_vk_vstage: frames %lld..%lld: %.1f stage lookups a frame missed the stage's last variant (%d samplers made)\n", (long long)frame - 300, (long long)frame, (double)(g_vstage_slow - vs_last) / 300.0, g_nsmp); vs_last = g_vstage_slow; }
         {   static LONG64 lg[GEN_N], lw[GEN_N], lcalls, lhits, lagain, lagain_b, lbytes;
             double g[GEN_N], w[GEN_N];

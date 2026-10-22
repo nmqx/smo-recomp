@@ -1526,7 +1526,10 @@ static void scan_sig(Scan *s) {
     s->sig_ok = pkey_targets_of(&s->sig, s->ncol, s->col, &s->depth) && (s->ncol || s->depth.tex);
     s->sig_tag = (uint32_t)fnv(0xcbf29ce484222325ULL, &s->sig, sizeof s->sig);
 }
+/* the integer texture kinds as bound when the batch begins: the scan may run beside the replay (SMO_VK_MT), which changes R */
+static uint32_t g_scan_ti[2], g_scan_tsi[2];
 static void scan_begin(Scan *s) {
+    g_scan_ti[0] = (uint32_t)R.tex_int[0]; g_scan_ti[1] = (uint32_t)R.tex_int[1]; g_scan_tsi[0] = (uint32_t)R.tex_sint[0]; g_scan_tsi[1] = (uint32_t)R.tex_sint[1];
     s->prog[0] = R.prog[0]; s->prog[1] = R.prog[1]; s->gprog = R.prog[2]; s->ncol = R.ncol; memcpy(s->col, R.col, sizeof s->col); s->depth = R.depth;
     s->nattr = R.nattr; memcpy(s->vattr, R.vattr, sizeof s->vattr); s->attr_new = 1; s->logic = R.logic;
     scan_sig(s);
@@ -1545,12 +1548,12 @@ static void scan_draw(Scan *s, unsigned prim) {
         }
     }
     uint64_t w[6] = {(uint64_t)(uintptr_t)p0->st[0].code ^ ((uint64_t)p0->serial << 44), p1 ? (uint64_t)(uintptr_t)p1->st[1].code ^ ((uint64_t)p1->serial << 44) : 0, s->sig_tag, tclass[prim] | (uint64_t)s->logic << 8 | (uint64_t)(p1 ? p1->sample_shading & 1 : 0) << 16,
-                     (uint64_t)s->ints << 32 | s->sints, (uint64_t)R.tex_int[0] << 32 | R.tex_int[1]};
+                     (uint64_t)s->ints << 32 | s->sints, (uint64_t)g_scan_ti[0] << 32 | g_scan_ti[1]};
     uint64_t tag = fnv(0xcbf29ce484222325ULL, w, sizeof w) | 1;
     unsigned slot = (unsigned)(tag >> 20) & 8191;
     if (g_scan_seen[slot] == tag) return;
     g_scan_seen[slot] = tag;
-    uint32_t key0[4] = {s->ints, s->sints, R.tex_int[0], R.tex_sint[0]}, key1[4] = {0, 0, R.tex_int[1], R.tex_sint[1]};
+    uint32_t key0[4] = {s->ints, s->sints, g_scan_ti[0], g_scan_tsi[0]}, key1[4] = {0, 0, g_scan_ti[1], g_scan_tsi[1]};
     VStage *vs = p0->st[0].vk, *fs = p1 ? p1->st[1].vk : NULL;
     int fs_made = !p1 || (fs && fs->state == 2 && fs->fo == 0 && key_fits(1, key1, fs->key, fs->dep, fs->tex_units));
     int vs_made = fs_made && vs && vs->state == 2 && key_fits(0, key0, vs->key, vs->dep, vs->tex_units) && vs->fo == (fs && fs->ok ? fs->in_attr & ~(vs->out_attr & ~vs->fo) : 0);
@@ -1614,6 +1617,31 @@ static void scan_list(uint64_t handle, int depth, Scan *s) {
         off += m->size;
     }
 }
+/* SMO_VK_MT=1: the look-ahead runs on a thread of its own while the render thread replays the same batch (it used to run
+ * first, on the render thread: about 1 ms a frame in New Donk City). It only queues stages and pipelines for the workers;
+ * what it reads that the replay may change at the same time (a texture's VTex being made) can at worst make a guess that is
+ * not needed. scan_async_wait() before the batch's job returns: the lists stay valid while it reads them. */
+static struct { HANDLE thread, go, done; const uint64_t *handles; int count, busy; Scan s; } SA;
+static int mt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_MT"); on = e && atoi(e) > 0; } return on; }
+static DWORD WINAPI scan_thread(void *arg) {
+    (void)arg;
+    os_pin_host_thread();
+    for (;;) {
+        WaitForSingleObject(SA.go, INFINITE);
+        LONG64 ts = tk();
+        for (int i = 0; i < SA.count; i++) scan_list(SA.handles[i], 0, &SA.s);
+        g_tm[9] += tk() - ts;
+        SetEvent(SA.done);
+    }
+    return 0;
+}
+static void scan_async_start(const uint64_t *handles, int count) {
+    if (!SA.thread) { SA.go = CreateEventA(NULL, FALSE, FALSE, NULL); SA.done = CreateEventA(NULL, FALSE, FALSE, NULL); SA.thread = CreateThread(NULL, 0, scan_thread, NULL, 0, NULL); }
+    scan_begin(&SA.s);
+    SA.handles = handles; SA.count = count; SA.busy = 1;
+    SetEvent(SA.go);
+}
+static void scan_async_wait(void) { if (SA.busy) { WaitForSingleObject(SA.done, INFINITE); SA.busy = 0; } }
 static void prewarm_wait(void) {                   /* render thread, before its first batch */
     if (g_pw_waited) return;
     g_pw_waited = 1;

@@ -212,9 +212,27 @@ uint64_t os_host_cpu_mask(void) {
     }
     return mask;
 }
+/* SMO_HOST_LAYOUT=1: the render thread gets the lowest core of that mask to itself (one processor of it, the core's second
+ * hardware thread left idle) and the runtime's other threads the rest, so that no helper shares a core with it. */
+static int host_layout(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_HOST_LAYOUT"); on = e && atoi(e) > 0; } return on; }
+static uint64_t render_core_mask(void) {          /* both processors of the lowest core in the host mask, or 0 */
+    uint64_t m = os_host_cpu_mask();
+    if (!m) return 0;
+    int b = 0;
+    while (!(m >> b & 1)) b++;
+    return (3ull << (b & ~1)) & m;
+}
 void os_pin_host_thread(void) {
     uint64_t m = os_host_cpu_mask();
+    if (m && host_layout() && (m & ~render_core_mask())) m &= ~render_core_mask();
     if (m) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)m);
+}
+void os_pin_render_thread(void) {
+    uint64_t rc = render_core_mask();
+    if (!host_layout() || !rc) { os_pin_host_thread(); return; }
+    uint64_t one = rc & (~rc + 1);                 /* the core's first processor only */
+    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)one);
+    printf("nn::os: SMO_HOST_LAYOUT=1: the render thread alone on processor mask %llx, the runtime's other threads on %llx\n", (unsigned long long)one, (unsigned long long)(os_host_cpu_mask() & ~rc));
 }
 static void apply_sched(HANDLE h, uint64_t core_mask) {
     DWORD_PTR m = 0;

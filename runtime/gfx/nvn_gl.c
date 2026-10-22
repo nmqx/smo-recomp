@@ -3907,6 +3907,7 @@ static void render_loop(void) {
 }
 
 void os_pin_host_thread(void);                    /* os_threads.c: the runtime's busy threads away from the console cores */
+void os_pin_render_thread(void);
 static DWORD WINAPI render_thread(LPVOID arg) {
     (void)arg;
     pf_job_submit = g_rb->submit; pf_job_present = g_rb->present;
@@ -3914,7 +3915,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     PIXELFORMATDESCRIPTOR pfd;
     g_render_tid = GetCurrentThreadId();
     if (g_vk) {                                 /* no OpenGL context, no shader workers; the jobs go to nvn_vk.c (vk_route) */
-        os_pin_host_thread();                   /* away from the console cores (os_threads.c) */
+        os_pin_render_thread();                 /* away from the console cores; with SMO_HOST_LAYOUT=1 on a core of its own (os_threads.c) */
         nvn_vk_init(g_hwnd);
         hitch_set_render();
         SetEvent(g_ready_event);
