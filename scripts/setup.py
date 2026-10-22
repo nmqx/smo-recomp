@@ -116,7 +116,7 @@ def main():
         print('\n'.join(NAMES))
         return
     if a.status:
-        print('Super Mario Odyssey %s: %s' % (T.VERSION, os.path.relpath(BUILD, REPO)))
+        print('Super Mario Odyssey %s: %s' % (T.game_version(), os.path.relpath(BUILD, REPO)))
         for name, made, done, _ in STEPS:
             state = 'runs every time (incremental)' if done is None else ('done' if done() else 'to do')
             print('  %-10s %-28s %s' % (name, made, state if name not in ('deps', 'check') else 'on demand'))

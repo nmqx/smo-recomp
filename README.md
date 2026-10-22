@@ -1,7 +1,14 @@
 # smo-recomp
 
-A native Windows x64 version of *Super Mario Odyssey* (1.4.1), made by **static recompilation** of the Nintendo
-Switch game, with its own runtime and a Vulkan renderer.
+A native Windows x64 version of *Super Mario Odyssey* (1.4.1, or the 1.3.0 update), made by **static recompilation** of
+the Nintendo Switch game, with its own runtime and a Vulkan renderer.
+
+> **This fork adds:** the 1.3.0 update as a second accepted version (its program is the same NintendoSDK 7.3.2 build:
+> 54,214 functions, every one lifted); **frame interpolation to 120 fps** with the GPU's optical flow engine (NVIDIA RTX
+> 30 and later, `frame_interpolation = optical_flow`), with late frames of the game bridged by predicted frames; the
+> runtime's own threads kept off the processors of the game's console cores; and a fix for the shader cache, which was
+> never written on a fresh build. See [What this fork changes](#what-this-fork-changes) and
+> [Building, step by step](#building-step-by-step).
 
 It is **not an emulator**: there is no CPU interpreter and no JIT, and no console firmware runs. The game's AArch64
 machine code is translated to C ahead of time and compiled for the PC; the system libraries, graphics API, audio,
@@ -74,6 +81,78 @@ py -3.13 -m venv .venv
 
 The first build takes a while (lifting and compiling the game); later runs of `setup.py` only redo what changed.
 [`docs/building.md`](docs/building.md) has the details, settings and troubleshooting.
+
+## Building, step by step
+
+Measured on Windows 11 with an RTX 3090 and a Ryzen 5 3600XT: about 6 minutes for a first build (lift 10 s, compile
+about 3 minutes on 12 threads, link 1 minute).
+
+1. **Dump your own game** from your own console with a homebrew dumper that writes decrypted files (nxdumptool), and lay
+   the dump out in one folder:
+   ```
+   <dump>\
+     exefs\          the program's ExeFS with the update (1.4.1 or 1.3.0): main, main.npdm, sdk, rtld, subsdk0
+     exefs-1.0.0\    the base game's ExeFS (or only its main): its symbols name the update's functions
+     romfs\          the RomFS with the update applied (about 5.7 GB)
+     control.nacp    the update's control data (its display version is checked: 1.4.1 or 1.3.0)
+     manual\         optional: the Help pages (html-document\...)
+     fonts\          optional: the console's shared fonts (.bfttf)
+   ```
+   Keep it on a fast drive: the build reads the RomFS in place.
+2. **Install the tools** (paths are the defaults; each has a variable to point elsewhere):
+   - Python 3.13 (`py -3.13`).
+   - LLVM/clang **9.0.0** exactly: `LLVM-9.0.0-win64.exe` from [releases.llvm.org/9.0.0](https://releases.llvm.org/9.0.0/)
+     (it is an NSIS archive: `7z x LLVM-9.0.0-win64.exe -oC:\llvm-9.0.0` unpacks it without installing), or set `LLVM_ROOT`.
+   - Visual Studio Build Tools with the C++ workload and a Windows 10/11 SDK (2019 is the documented one; 2026 Build Tools
+     with SDK 10.0.26100 also builds and links with 0 failures).
+   - The [Vulkan SDK](https://vulkan.lunarg.com/) 1.4. If it is not under `C:\VulkanSDK`, set `VULKAN_HEADERS` to its
+     `Include` folder.
+   - SDL3 3.4.18: unzip `SDL3-devel-3.4.18-VC.zip` (from the SDL releases on GitHub) into `deps\SDL3-3.4.18`.
+   - The WebView2 SDK: download `https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40` (a `.nupkg` is a
+     zip) and unzip it into `deps\webview2-1.0.2903.40`.
+3. **Build:**
+   ```bat
+   py -3.13 -m venv .venv
+   .venv\Scripts\python -m pip install lz4 capstone unicorn numpy Pillow
+   .venv\Scripts\python scripts\setup.py --only deps
+   .venv\Scripts\python scripts\setup.py --dump "<dump>"
+   ```
+   `--only deps` names anything missing. The setup resumes where it stopped if interrupted; after changing only the
+   runtime, `--only link` is enough.
+4. **Play:**
+   ```bat
+   .venv\Scripts\python scripts\run.py play --exe smo_native.exe --seconds 0
+   ```
+   Saves are in `build\userdata\save` (`Common.bin`, `File1.bin`). To use an existing save, put its files there. A test
+   run's `--userdata <folder>` is a user-data root: its save goes in `<folder>\save\`, not in `<folder>` itself.
+   Settings are in `build\config\graphics.ini` and `build\config\controllers.ini` (written on the first run). F11
+   switches to fullscreen.
+5. The first visit of each place compiles its shaders (loading screens wait for them); they are kept in `build\cache`
+   and later visits load them.
+
+## What this fork changes
+
+- **1.3.0 accepted** (`tools/target.py` `VERSIONS`): the import, the generated tables and the setup report the dump's own
+  version.
+- **Frame interpolation** (`runtime/gfx/nvn_vk_interp.c`, `frame_interpolation = optical_flow` in `graphics.ini`;
+  `SMO_VK_INTERP=1/0` wins). Each frame of the game is copied out; the GPU's optical flow engine (`VK_NV_optical_flow`,
+  on its own queue) measures the motion to the frame before in both directions on a 4x4 grid; a compute stage makes the
+  frame between them (for every pixel the pair of samples joined best by the forward flow, the backward flow or no
+  motion, so the 2D interface stays still); a presenter thread with a queue of its own shows the made frame, then the
+  game's own half a frame later: 120 frames a second while the game runs at 60, about 8 ms later than without it.
+  When the game's next frame is late, the presenter shows the newest frame moved on along its own motion instead
+  (up to 6 times, `SMO_VK_INTERP_EXT_MAX`; `SMO_VK_INTERP_EXT=0` turns it off). Debug: `SMO_VK_INTERP_STATS=1`,
+  `SMO_VK_INTERP_SHOT=<play frame>[,...]` (pictures of a made frame and its neighbours).
+- **The runtime's own threads off the game's processors** (`runtime/os/os_threads.c` `os_host_cpu_mask`): the render
+  thread, the pipeline workers and the presenter run on the processors the console-core model leaves free, not on those
+  of the game's three console cores or their second hardware threads (`SMO_HOST_PIN=0` turns it off,
+  `SMO_HOST_CPUS=<hex>` chooses).
+- **Shader cache fix** (`runtime/gfx/nvn_vk_pipelines.c`): `..\cache\vk` was made with one `CreateDirectory` call,
+  which fails when `build\cache` does not exist yet, so a fresh build compiled every shader again at every start.
+
+Measured with `SMO_HITCH=25` on the same scripted 4-minute route (a new game's opening, Ryzen 5 3600XT, RTX 3090):
+frames that missed the 60 Hz refresh by more than 25 ms, 173 without interpolation, 91 with it (and 78 of those bridged on
+screen by predicted frames). The heaviest places (New Donk City's streets) are still CPU-bound on a 6-core Zen 2.
 
 ## Repository layout
 

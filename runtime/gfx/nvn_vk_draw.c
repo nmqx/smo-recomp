@@ -16,6 +16,8 @@
 #include "tex_decode.h"
 #include "smo_ui.h"                                    /* UiMenuJob: the amiibo menu's pictures (vk_menu) */
 static int have_targets_live(void);
+static void ofx_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext, void ***tail);      /* nvn_vk_interp.c */
+static void ofx_start(void);
 
 #define VKD(X) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) \
@@ -104,6 +106,7 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
     if (D.ext_gpl && vk_gpl_mode()) { D.exts[D.next++] = "VK_KHR_pipeline_library"; EXT(has_gpl, "VK_EXT_graphics_pipeline_library", gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT) }
 #undef EXT
     if (has_name(dext, ndext, "VK_KHR_push_descriptor") && !(getenv("SMO_VK_PUSH") && !atoi(getenv("SMO_VK_PUSH")))) { D.has_push = 1; D.exts[D.next++] = "VK_KHR_push_descriptor"; }
+    ofx_device_info(di, dext, ndext, &tail);       /* frame interpolation: VK_NV_optical_flow and its queue, when asked for */
     vkGetPhysicalDeviceFeatures2(V.gpu, &D.f2);                    /* every supported feature of these structures is enabled */
     D.has_vids = D.has_vids && D.vids.vertexInputDynamicState; D.has_cbc = D.has_cbc && D.cbc.customBorderColors && D.cbc.customBorderColorWithoutFormat;
     D.has_pv = D.has_pv && D.pv.provokingVertexLast; D.has_iu8 = D.has_iu8 && D.iu8.indexTypeUint8; D.has_plr = D.has_plr && D.plr.primitiveTopologyListRestart;
@@ -357,6 +360,9 @@ static void cmd_begin(void) {
     if (g_ts_on > 0) { vkCmdResetQueryPool(s->cmd, g_ts_pool, (uint32_t)R.cur * 2, 2); vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_ts_pool, (uint32_t)R.cur * 2); }
     garbage_collect();
 }
+/* the next submission also signals this timeline semaphore with this value (nvn_vk_interp.c), then it is cleared */
+static VkSemaphore g_sub_tl;
+static uint64_t g_sub_tl_val;
 /* Ends the command buffer being recorded and gives it to the queue. Returns its number (the last one when nothing was recorded). */
 static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     if (!R.recording) { if (!wait && !signal) return R.serial; cmd_begin(); }
@@ -366,11 +372,19 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     VKC(vkEndCommandBuffer(s->cmd));
     VkFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo sb = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    VkSemaphore sig[2];
+    uint64_t sval[2] = {0, 0};
+    VkTimelineSemaphoreSubmitInfo tsi = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
     if (wait) { sb.waitSemaphoreCount = 1; sb.pWaitSemaphores = &wait; sb.pWaitDstStageMask = &stage; }
-    if (signal) { sb.signalSemaphoreCount = 1; sb.pSignalSemaphores = &signal; }
+    if (signal) sig[sb.signalSemaphoreCount++] = signal;
+    if (g_sub_tl) { sval[sb.signalSemaphoreCount] = g_sub_tl_val; sig[sb.signalSemaphoreCount++] = g_sub_tl; tsi.signalSemaphoreValueCount = sb.signalSemaphoreCount; tsi.pSignalSemaphoreValues = sval; sb.pNext = &tsi; g_sub_tl = NULL; }
+    sb.pSignalSemaphores = sig;
     sb.commandBufferCount = 1; sb.pCommandBuffers = &s->cmd;
     nvn_tl(15, (int)R.frame_draws);               /* SMO_FRAMETL: a submission, with the draws of the frame so far */
-    VKC(vkQueueSubmit(V.queue, 1, &sb, s->fence));
+    AcquireSRWLockExclusive(&g_qlock);            /* the queue is shared with the interpolation's presenter thread */
+    VkResult rq = vkQueueSubmit(V.queue, 1, &sb, s->fence);
+    ReleaseSRWLockExclusive(&g_qlock);
+    VKC(rq);
     s->pending = 1; s->serial = ++R.serial;
     s->rlap1 = R.ring_lap; s->rpos1 = R.ring_pos;
     R.recording = 0; R.cmd = NULL; R.flushes++;
@@ -3209,6 +3223,16 @@ static void mem_report(LONG64 frame) {
            (double)g_mod_destroy_tk * 1000.0 / (double)fq.QuadPart, (long long)g_mod_again);
     fflush(stdout);
 }
+#include "nvn_vk_interp.c"                         /* frame interpolation (ofx_present and its presenter thread) */
+/* the region of the window texture that is shown, in the image's pixels */
+static void present_crop(const PresentJob *j, const VTex *vt, int s4[4]) {
+    s4[0] = 0; s4[1] = 0; s4[2] = vt->w; s4[3] = vt->h;
+    if (j->win->crop[2] > 0 && j->win->crop[3] > 0) memcpy(s4, j->win->crop, sizeof(int) * 4);
+    if (vt->rs && j->win->crop[2] > 0 && j->win->crop[3] > 0) {      /* the crop is in the game's pixels */
+        int x1 = rs_edge(s4[0] + s4[2], vt->sx, vt->w), y1 = rs_edge(s4[1] + s4[3], vt->sy, vt->h);
+        s4[0] = rs_edge(s4[0], vt->sx, vt->w); s4[1] = rs_edge(s4[1], vt->sy, vt->h); s4[2] = x1 - s4[0]; s4[3] = y1 - s4[1];
+    }
+}
 static void vk_present(void *arg) { vk_present2(arg, 0); }
 static void vk_present2(void *arg, int progress) {
     PresentJob *j = arg;
@@ -3294,6 +3318,13 @@ swap: ;
             cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated);
         }
     }
+    if (O.on && !progress && vt && vt->samples == 1 && j->win) {      /* frame interpolation: the presenter thread shows this frame */
+        if (O.swap_bad) { ofx_drain(); cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); InterlockedExchange(&O.swap_bad, 0); }
+        int c4[4];
+        present_crop(j, vt, c4);
+        if ((V.swapchain || swapchain_create()) && ofx_present(vt, c4)) { InterlockedIncrement64(&g_wd_try); InterlockedIncrement64(&g_vk_frames); g_wd_beat = tk(); goto shown; }
+    }
+    if (O.thread) { ofx_drain(); O.have_prev = 0; InterlockedExchange(&O.swap_bad, 0); }      /* this present is the render thread's own */
     int ok = V.swapchain || swapchain_create();
     InterlockedIncrement64(&g_wd_try);
     if (ok) {
@@ -3320,12 +3351,8 @@ swap: ;
         image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         if (vt && vt->samples == 1) {
             VkImageBlit b;
-            int s4[4] = {0, 0, vt->w, vt->h};
-            if (j->win->crop[2] > 0 && j->win->crop[3] > 0) memcpy(s4, j->win->crop, sizeof s4);
-            if (vt->rs && j->win->crop[2] > 0 && j->win->crop[3] > 0) {      /* the crop is in the game's pixels */
-                int x1 = rs_edge(s4[0] + s4[2], vt->sx, vt->w), y1 = rs_edge(s4[1] + s4[3], vt->sy, vt->h);
-                s4[0] = rs_edge(s4[0], vt->sx, vt->w); s4[1] = rs_edge(s4[1], vt->sy, vt->h); s4[2] = x1 - s4[0]; s4[3] = y1 - s4[1];
-            }
+            int s4[4];
+            present_crop(j, vt, s4);
             memset(&b, 0, sizeof b);
             b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1; b.dstSubresource = b.srcSubresource;
             b.srcOffsets[0].x = s4[0]; b.srcOffsets[0].y = s4[1]; b.srcOffsets[1].x = s4[0] + s4[2]; b.srcOffsets[1].y = s4[1] + s4[3]; b.srcOffsets[1].z = 1;
@@ -3344,6 +3371,7 @@ swap: ;
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) { g_wd_beat = tk(); }      /* the watchdog's heartbeat = a frame reached the window */
         if (!progress) InterlockedIncrement64(&g_vk_frames);
     }
+shown:
     g_wd_where = 0;
     if (progress) { g_ovl_presents++; return; }
     if (g_occ_qn) { LONG64 w0 = g_occ_waits; occ_resolve(g_occ_present ? g_occ_qn : 0); g_occ_present_waits += g_occ_waits > w0; }      /* the frame's occlusion counts (read by the game in the next frame) */
@@ -3500,6 +3528,7 @@ static void vkd_init(void) {
     cmd_wait_all();
     CreateDirectoryA("../cache/vk", NULL);
     prewarm_start();
+    ofx_start();                                  /* frame interpolation (needs smo_glslang.dll, loaded by prewarm_start) */
     wd_start();
     printf("nvn_vk: drawing part ready: %d command buffers in flight, stream ring %llu MB, %u memory types; debug checks %s\n", NSLOT, (unsigned long long)(R.ring_size >> 20), (unsigned)D.mp.memoryTypeCount, D.debug ? "on" : "off (SMO_VK_DEBUG=1)");
     if (RS_ON) printf("nvn_vk_scale: internal resolution scale %.3f (%s): screen-class targets are made at %d x %d instead of 1920 x 1080; fragment stages are another translation\n",

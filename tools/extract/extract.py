@@ -150,8 +150,9 @@ def main():
             if not p:
                 raise DumpError('%s: %s is missing (see docs/building.md for what to dump)' % (dump, what))
         info = nso.nacp_info(open(nacp, 'rb').read())
-        if info['display_version'] != T.VERSION:
-            raise DumpError('%s: version %s, this project builds %s' % (nacp, info['display_version'] or '(none)', T.VERSION))
+        if info['display_version'] not in T.VERSIONS:
+            raise DumpError('%s: version %s, this project builds %s' % (nacp, info['display_version'] or '(none)',
+                                                                       ' or '.join(T.VERSIONS)))
         if not all(os.path.isdir(os.path.join(romfs, d)) for d in ('SystemData', 'StageData', 'ObjectData')):
             raise DumpError('%s: not the game\'s RomFS (no SystemData, StageData or ObjectData folder)' % romfs)
         upd_files = read_exefs(exefs, 'update', ('main', 'main.npdm', 'sdk', 'rtld'))

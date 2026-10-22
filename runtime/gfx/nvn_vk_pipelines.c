@@ -1266,6 +1266,7 @@ static void job_draw(Job *j) {                     /* a draw the look-ahead met 
 }
 static DWORD WINAPI pw_main(void *arg) {
     (void)arg;
+    os_pin_host_thread();
     LONG wslot = InterlockedIncrement(&g_wk_n) - 1;
     if (wslot < 64) { g_wk[wslot].kind = -1; g_wk[wslot].tid = GetCurrentThreadId(); }
     for (;;) {                                     /* 1. the keys of earlier runs */
@@ -1424,6 +1425,9 @@ static int piperec_cmp(const void *a, const void *b) { return memcmp(a, b, sizeo
 static void prewarm_start(void) {
     InitializeCriticalSection(&g_sh_lock); InitializeCriticalSection(&g_gpl_lock);
     InitializeConditionVariable(&g_sh_cv); InitializeConditionVariable(&g_jq_cv);
+    {   char up[200], *s;                            /* the folder above first (..\cache on a fresh build: CreateDirectory makes one level) */
+        snprintf(up, sizeof up, "%s", vkc_dir());
+        if ((s = strrchr(up, '/')) || (s = strrchr(up, '\\'))) { *s = 0; CreateDirectoryA(up, NULL); } }
     CreateDirectoryA(vkc_dir(), NULL); CreateDirectoryA(vkc_file("spv"), NULL); CreateDirectoryA(vkc_file("stage"), NULL);
     if (getenv("SMO_VK_CACHE")) printf("nvn_vk: cache folder %s (SMO_VK_CACHE)\n", vkc_dir());
     {   HMODULE m = LoadLibraryA("smo_glslang.dll");

@@ -36,6 +36,10 @@
 static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext);     /* nvn_vk_draw.c (included at the end) */
 static void vkd_init(void);
 static void vkd_shutdown(void);
+static void ofx_drain(void);                              /* nvn_vk_interp.c: the presenter thread has shown all it was given */
+static void ofx_stop(void);
+static SRWLOCK g_qlock;                                   /* V.queue: the render thread and that presenter submit to it */
+void os_pin_host_thread(void);                            /* os_threads.c: the runtime's busy threads away from the console cores */
 
 typedef char vk_min_check_properties[sizeof(VkPhysicalDeviceProperties) == 824 ? 1 : -1];
 typedef char vk_min_check_caps[sizeof(VkSurfaceCapabilitiesKHR) == 52 ? 1 : -1];
@@ -182,7 +186,8 @@ static int has_name(const VkExtensionProperties *e, uint32_t n, const char *name
 static void wait_last_submit(void);
 static void swapchain_destroy(void) {
     if (!V.swapchain) return;
-    wait_last_submit();                                  /* also resets the fence for the next submit */
+    ofx_drain();
+    wait_last_submit();                                 /* also resets the fence for the next submit */
     vkDeviceWaitIdle(V.device);
     vkDestroySwapchainKHR(V.device, V.swapchain, NULL);
     V.swapchain = NULL; V.image_count = 0;
@@ -436,6 +441,7 @@ static void wait_last_submit(void) {
 /* Clears the next swapchain image to one colour and presents it. Never waits for the display (see the present mode). */
 static void present_colour(const float rgba[4]) {
     if (!V.alive) return;
+    ofx_drain();
     wait_last_submit();
     if (!V.swapchain && !swapchain_create()) { InterlockedIncrement64(&g_vk_skipped); return; }
     uint32_t index = 0;
@@ -502,6 +508,7 @@ void nvn_vk_flush(int finish) { if (V.alive && finish) wait_last_submit(); }
 
 void nvn_vk_shutdown(void) {
     if (!V.alive) return;
+    ofx_stop();
     V.alive = 0;
     vk_ok("vkDeviceWaitIdle", vkDeviceWaitIdle(V.device));
     vkd_shutdown();

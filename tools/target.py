@@ -11,6 +11,9 @@ import os
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VERSION = '1.4.1'                                       # the game version this project builds
+# the update's display versions the build accepts: 1.3.0's program is NintendoSDK 7.3.2 as 1.4.1's, and everything the
+# runtime needs by name in it is matched with the base game's main the same way
+VERSIONS = ('1.4.1', '1.3.0')
 BUILD = os.path.join(REPO, 'build')
 DUMP = os.path.join(BUILD, 'dump', 'update')
 BASE_DUMP = os.path.join(BUILD, 'dump', 'base')
@@ -50,3 +53,8 @@ def dump_version():
     if not os.path.isfile(p):
         return None
     return open(p, 'rb').read()[0x3060:0x3070].split(b'\0')[0].decode('ascii', 'replace')
+
+
+def game_version():
+    """The version of the imported dump (one of VERSIONS), or VERSION before an import."""
+    return dump_version() or VERSION
