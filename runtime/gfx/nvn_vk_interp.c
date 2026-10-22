@@ -608,6 +608,7 @@ static void ofx_show(VkImage src, uint64_t wait, int ext_slot, float alpha) {
     bl.srcOffsets[1].x = O.w; bl.srcOffsets[1].y = O.h; bl.srcOffsets[1].z = 1;
     bl.dstOffsets[1].x = (int32_t)V.extent.width; bl.dstOffsets[1].y = (int32_t)V.extent.height; bl.dstOffsets[1].z = 1;
     vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+    ov_record(cb, V.images[index]);
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = 0; b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
     vkEndCommandBuffer(cb);

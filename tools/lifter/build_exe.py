@@ -44,7 +44,7 @@ HOST_SOURCES = {
     'services': ['nnservices.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmovie_mf.c'],
     'game': ['smo_nerve.c', 'smo_fast.c', 'smo_selftest.c', 'smo_ui.c', 'smo_amiibo.c', 'smo_guide.c'],
 }
-INCLUDED = [T.runtime('gfx', n) for n in ('nvn_vk_draw.c', 'nvn_vk_pipelines.c', 'nvn_vk_watchdog.c', 'nvn_vk_interp.c')]
+INCLUDED = [T.runtime('gfx', n) for n in ('nvn_vk_draw.c', 'nvn_vk_pipelines.c', 'nvn_vk_watchdog.c', 'nvn_vk_interp.c', 'nvn_vk_overlay.c')]
 GEN_SOURCES = ['sdkdata.c', 'sdklift_gen.c']
 # RECOMP_HOST_OPT (default -O2) and RECOMP_ARCH (as build_main.py: e.g. -march=znver2) for the runtime; a change of them
 # recompiles nothing by itself: delete build\obj\host (or touch a runtime header) first

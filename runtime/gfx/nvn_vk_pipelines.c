@@ -360,6 +360,7 @@ static void skip_note(int what, uint64_t vh, uint64_t fh) {
     g_skip_n++; g_skip_fr_n++; if (what) g_skip_pipe++; else g_skip_stage++;
     { static int nl; if (nl++ < 600) printf("nvn_vk_skip: frame %lld: a draw left out, its %s was not ready: vertex code %016llx, fragment code %016llx\n", (long long)nvn_front_frame_next(), what ? "pipeline (stage library or link)" : "stage", (unsigned long long)vh, (unsigned long long)fh); }
 }
+static LONG64 g_vstage_slow;          /* vstage_get calls that missed the stage's last variant (ssrc_hb over the code, the table under g_sh_lock) */
 static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo, int gprim) {      /* gprim: a geometry stage's primitive class (0 for the others) */
     Stage *st = &p->st[s];
     VStage *v = st->vk;
@@ -367,6 +368,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo, int 
     int how;
     if (!st->code) return NULL;
     if (v && v->state == 2 && v->fo == fo && v->gprim == gprim && key_fits(s, key, v->key, v->dep, v->tex_units)) return v->ok ? v : NULL;
+    g_vstage_slow++;
     if (!ssrc_of(&src, p, s)) return NULL;
     src.gprim = gprim;
     if (s != 5 && skip_active()) {                 /* shader_wait = skip: only what is ready */
@@ -966,7 +968,27 @@ static void predict_pair(PairRec *pr, int i) {
     job_push(j);
 }
 /* Render thread, at a draw: the pipeline of the key; made here, or waited for, when it is not ready (the frame is late). */
+/* render thread: the pipelines made and used so far by their key, direct-mapped, in front of g_sh_lock and the byte-wise
+ * hash of pipe_get (pipelines are never freed before the end) */
+static Pipe *g_pipe_hot[16384];
+static unsigned pkey_slot(const PKey *k) {
+    const uint8_t *b = (const uint8_t *)k;
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    size_t i = 0;
+    for (; i + 8 <= sizeof *k; i += 8) { uint64_t w; memcpy(&w, b + i, 8); h = (h ^ w) * 0xff51afd7ed558ccdull; h ^= h >> 32; }
+    for (; i < sizeof *k; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    return (unsigned)(h ^ (h >> 29)) & 16383;
+}
+static Pipe *pipe_get2(const PKey *k, VStage *vs, VStage *fs);
 static Pipe *pipe_get(const PKey *k, VStage *vs, VStage *fs) {
+    unsigned slot = pkey_slot(k);
+    Pipe *c = g_pipe_hot[slot];
+    if (c && c->state == 2 && c->used && !memcmp(&c->k, k, sizeof *k)) return c;
+    Pipe *p = pipe_get2(k, vs, fs);
+    if (p && p->state == 2 && p->used) g_pipe_hot[slot] = p;
+    return p;
+}
+static Pipe *pipe_get2(const PKey *k, VStage *vs, VStage *fs) {
     uint64_t h = fnv(0xcbf29ce484222325ULL, k, sizeof *k);
     int mine = 0, waited = 0;
     LONG64 t0 = 0;
