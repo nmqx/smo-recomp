@@ -22,7 +22,7 @@ static void ofx_start(void);
 #define VKD(X) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
-    X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
+    X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkFreeDescriptorSets) X(vkUpdateDescriptorSets) \
     X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetDepthBias) \
     X(vkCmdSetBlendConstants) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetLineWidth) X(vkCmdSetCullMode) X(vkCmdSetFrontFace) \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) \
@@ -352,6 +352,10 @@ static void slot_wait(Slot *s) {
 static void garbage_collect(void);
 static uint32_t g_tset_gen = 1;                   /* texture descriptor sets live as long as the command buffer whose pools they come from */
 static int g_tset_used, g_tset_list_used;
+/* the texture sets kept across command buffers (tc_get): pools, sets allocated, written again for another list, lists it could not take */
+static int g_tc_npool;
+static LONG64 g_tc_made, g_tc_rewritten, g_tc_busy;
+static int tc_on(void) { static int on = -1; if (on < 0) on = !(getenv("SMO_VK_TSET_CACHE") && !atoi(getenv("SMO_VK_TSET_CACHE"))); return on; }
 static void cmd_begin(void) {
     if (R.recording) return;
     g_tset_gen++; g_tset_used = 0; g_tset_list_used = 0;
@@ -556,7 +560,7 @@ static VkFormat vertex_vkfmt(int nf) {
 }
 
 /* ---------------------------------------------------------------- images */
-typedef struct VView { EView e; int vtype, attach; VkImageView view; struct VView *next; } VView;
+typedef struct VView { EView e; int vtype, attach; VkImageView view; uint64_t id; struct VView *next; } VView;      /* id: never given to another view (vt_view), unlike the handle a driver may give again once the view is destroyed */
 static LONG64 g_storage_tex;                       /* textures whose image has storage use (vt_get2) */
 struct VTex {
     uint32_t magic; Tex *t; VkImage img; VMem mem; VkFormat fmt; VkImageLayout layout; VkFlags aspect;
@@ -1095,9 +1099,11 @@ enum { DIM_1D, DIM_2D, DIM_3D, DIM_CUBE, DIM_1DA, DIM_2DA, DIM_CUBEA };
 static const VkImageViewType k_vtype[7] = {VK_IMAGE_VIEW_TYPE_1D, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_VIEW_TYPE_CUBE, VK_IMAGE_VIEW_TYPE_1D_ARRAY, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY};
 static int target_dim(int target) { static const int m[10] = {DIM_1D, DIM_2D, DIM_3D, DIM_1DA, DIM_2DA, DIM_2D, DIM_2DA, DIM_2D, DIM_CUBE, DIM_CUBEA}; return target >= 0 && target < 10 ? m[target] : DIM_2D; }
 /* dim < 0: an attachment view (one level, one layer, both aspects, no swizzle). */
-static VkImageView vt_view(VTex *vt, const EView *e, int dim, int attach) {
-    for (VView *n = vt->views; n; n = n->next) if (n->vtype == dim && n->attach == attach && !memcmp(&n->e, e, sizeof *e)) return n->view;
+static VView *vt_vview(VTex *vt, const EView *e, int dim, int attach) {
+    static uint64_t ids;
+    for (VView *n = vt->views; n; n = n->next) if (n->vtype == dim && n->attach == attach && !memcmp(&n->e, e, sizeof *e)) return n;
     VView *n = calloc(1, sizeof *n);
+    n->id = ++ids;
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     static const VkComponentSwizzle sw[6] = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A};
     int ex, dec;
@@ -1123,8 +1129,9 @@ static VkImageView vt_view(VTex *vt, const EView *e, int dim, int attach) {
     VkResult r = vkCreateImageView(V.device, &ci, NULL, &n->view);
     if (r != VK_SUCCESS) vkd_fail("vkCreateImageView (type %d, format %d of image format %d, levels %d+%d, layers %d+%d of %d, attach %d): %s", (int)ci.viewType, (int)ci.format, (int)vt->fmt, e->lvl0, e->nlvl, e->lay0, e->nlay, vt->layers, attach, vk_result_name(r));
     n->next = vt->views; vt->views = n; R.views++;
-    return n->view;
+    return n;
 }
+static VkImageView vt_view(VTex *vt, const EView *e, int dim, int attach) { return vt_vview(vt, e, dim, attach)->view; }
 
 /* ---------------------------------------------------------------- samplers (shared by value, never deleted before shutdown) */
 static struct { SamplerParams p; VkSampler s; } g_smp[2048];
@@ -1307,8 +1314,92 @@ static VkDescriptorSet set_alloc(VkDescriptorSetLayout layout) {
 }
 static struct { uint64_t key; VkDescriptorSet set; uint32_t gen; VkDescriptorSetLayout dl; int n, off; } g_tset[4096];      /* texture sets of the command buffer being recorded */
 static struct { VTex *d2, *d1, *d3; VkImageView v[7]; } g_dummy;
-static struct { VkImageView view; VkSampler smp; VkImageLayout layout; } g_dtex[200], g_tset_list[32768];      /* g_tset_list: the lists of the cached sets, for the full comparison */
+/* one combined image sampler of a draw: vid = VView.id of the view (0: a dummy view, those live until shutdown), bind = its
+ * binding number (the universal layout tells the lists of different pipelines apart by it); no padding: hashed and compared as bytes */
+typedef struct { VkImageView view; VkSampler smp; uint64_t vid; VkImageLayout layout; uint32_t bind; } DTex;
+static DTex g_dtex[200], g_tset_list[32768];      /* g_tset_list: the lists of the cached sets, for the full comparison */
 static int g_ndtex;
+/* Texture sets kept across command buffers. The cache above (g_tset) lives as long as one command buffer and the game's
+ * frame is about 4 of them (more with forced submissions): in the heaviest scene 2,400 sets were allocated and written each
+ * frame for 1,600 found again. These entries own their sets (pools of their own, g_tc_pool) and outlive the command buffers.
+ * An entry is found by the hash of its list and a full comparison (layout, then views, samplers, image layouts, binding
+ * numbers: DTex) and remembers the number of the submission that last bound it (R.serial + 1 while it is being recorded).
+ * A set that submissions still pending bound may be bound again, not written: an entry is written for another list (or its
+ * set freed for one of another layout) only once that submission has finished (serial <= R.done). A view is named by its
+ * VView.id beside its handle: a texture's views are destroyed with its image (vk_drop, then garbage_collect once the GPU is
+ * done with it), and the driver may give a new view the handle of a destroyed one; the entry naming the old id never
+ * matches again, is never bound again, and is written over when its turn comes (writing or freeing a set that names
+ * destroyed views is allowed). Samplers and set layouts live until shutdown (vkd_shutdown, which empties the cache).
+ * 1024 buckets of 8 entries, the least recently bound one taken (a frame binds about 2,500 lists); pools of 512 sets of the
+ * universal layout (128 bindings), 32 at most. When every entry of a bucket is still in use by the GPU (or the pools are
+ * full) the set comes from the command buffer's pools through g_tset as before (counted). SMO_VK_TSET_CACHE=0: g_tset
+ * only, as before. */
+#define TC_BUCKETS 1024
+#define TC_WAYS 8
+#define TC_POOLS 32
+typedef struct { uint64_t key, serial; VkDescriptorSet set; VkDescriptorSetLayout dl; DTex *list; int n, cap, pool; } TcEnt;
+static TcEnt g_tc[TC_BUCKETS][TC_WAYS];
+static VkDescriptorPool g_tc_pool[TC_POOLS];
+static int tc_alloc(VkDescriptorSetLayout layout, TcEnt *e) {
+    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorSetCount = 1; ai.pSetLayouts = &layout;
+    for (int i = 0; ; i++) {
+        if (i == g_tc_npool) {
+            if (g_tc_npool == TC_POOLS) return 0;
+            VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536};      /* set 1 holds combined image samplers only; the universal layout has 128 */
+            VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; pi.maxSets = 1024; pi.poolSizeCount = 1; pi.pPoolSizes = &ps;
+            VKC(vkCreateDescriptorPool(V.device, &pi, NULL, &g_tc_pool[g_tc_npool++]));
+        }
+        ai.descriptorPool = g_tc_pool[i];
+        VkResult r = vkAllocateDescriptorSets(V.device, &ai, &e->set);
+        if (r == VK_SUCCESS) { e->pool = i; R.sets++; g_tc_made++; return 1; }
+        if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) vk_fatal("vkAllocateDescriptorSets", r);
+        e->set = NULL;
+    }
+}
+/* the entry of the list g_dtex (hash key, layout dl): *hit = 1 when it holds that list already; else it was taken for the
+ * list and its set must be written. NULL: no entry can take it now. */
+static TcEnt *tc_get(uint64_t key, VkDescriptorSetLayout dl, int *hit) {
+    TcEnt *b = g_tc[(unsigned)key & (TC_BUCKETS - 1)], *v = NULL;
+    int coll = 0;
+    *hit = 0;
+    for (int i = 0; i < TC_WAYS; i++) {
+        TcEnt *e = &b[i];
+        if (!e->set) { if (!v || v->set) v = e; continue; }
+        if (e->key == key) {
+            if (e->dl == dl && e->n == g_ndtex && !memcmp(e->list, g_dtex, sizeof g_dtex[0] * (size_t)g_ndtex)) { *hit = 1; return e; }
+            coll = 1;                              /* the same hash, another list: counted if no entry holds this one */
+        }
+        if (e->serial <= R.done && (!v || (v->set && e->serial < v->serial))) v = e;      /* the GPU is done with it: the least recently bound goes */
+    }
+    R.tset_collisions += coll;
+    if (!v) { g_tc_busy++; return NULL; }
+    if (v->set && v->dl != dl) { VKC(vkFreeDescriptorSets(V.device, g_tc_pool[v->pool], 1, &v->set)); v->set = NULL; }
+    if (v->set) g_tc_rewritten++;
+    else if (!tc_alloc(dl, v)) { g_tc_busy++; return NULL; }
+    if (v->cap < g_ndtex) { v->cap = g_ndtex < 16 ? 16 : g_ndtex; v->list = realloc(v->list, sizeof *v->list * (size_t)v->cap); }
+    v->key = key; v->dl = dl; v->n = g_ndtex;
+    memcpy(v->list, g_dtex, sizeof g_dtex[0] * (size_t)g_ndtex);
+    return v;
+}
+/* writes the list g_dtex into a texture set (each entry at its binding number) */
+static void tset_write(VkDescriptorSet set) {
+    static VkWriteDescriptorSet w[200];
+    static VkDescriptorImageInfo ii[200];
+    for (int i = 0; i < g_ndtex; i++) {
+        ii[i].sampler = g_dtex[i].smp; ii[i].imageView = g_dtex[i].view; ii[i].imageLayout = g_dtex[i].layout;
+        memset(&w[i], 0, sizeof w[i]);
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = set; w[i].dstBinding = g_dtex[i].bind; w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[i].pImageInfo = &ii[i];
+    }
+    vkUpdateDescriptorSets(V.device, (uint32_t)g_ndtex, w, 0, NULL);
+}
+static void tc_shutdown(void) {
+    for (int i = 0; i < g_tc_npool; i++) vkDestroyDescriptorPool(V.device, g_tc_pool[i], NULL);
+    for (int i = 0; i < TC_BUCKETS; i++) for (int k = 0; k < TC_WAYS; k++) free(g_tc[i][k].list);
+    memset(g_tc, 0, sizeof g_tc); g_tc_npool = 0;
+}
 /* The image view and sampler of one declared sampler of stage s. May end the pass (upload, layout change). */
 static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64_t row_stride, int64_t image_stride);
 /* a sampler whose handle the game keeps in one of its uniform buffers (mx_translate.c bindless_unit: unit
@@ -1374,6 +1465,7 @@ static void resolve_sampler(int s, VStage *v, int i) {
         }
     }
     g_dtex[g_ndtex].view = g_dummy.v[v->smp[i].dim]; g_dtex[g_ndtex].smp = g_smp_default; g_dtex[g_ndtex].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    g_dtex[g_ndtex].vid = 0; g_dtex[g_ndtex].bind = v->smp[i].binding;
     if (r & 1) {
         VTex *vt = vt_get(t);
         EView e;
@@ -1393,7 +1485,8 @@ static void resolve_sampler(int s, VStage *v, int i) {
         if (ok && vt->samples == 1) {
             if (attached && have_targets_live()) { if (!vt->feedback) { vt->feedback = 1; R.feedback++; pass_end(); } vt_layout(vt, VK_IMAGE_LAYOUT_GENERAL); }
             else vt_layout(vt, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            g_dtex[g_ndtex].view = vt_view(vt, &e, dim, 0); g_dtex[g_ndtex].layout = vt->layout;
+            VView *vv = vt_vview(vt, &e, dim, 0);
+            g_dtex[g_ndtex].view = vv->view; g_dtex[g_ndtex].vid = vv->id; g_dtex[g_ndtex].layout = vt->layout;
         } else { static int n; R.dummy_kind++;
             if (n < 3) printf("nvn_vk: (detail of the next line) frame %lld, program #%d, texture format 0x%x, %d x %d x %d, %d levels, draws so far with a dummy for a view-kind mismatch: %lld\n", (long long)nvn_front_frame_next(), R.prog[s] ? R.prog[s]->serial : -1, t->b.format, t->b.width, t->b.height, t->b.depth, nvn_front_tex_levels(t), (long long)R.dummy_kind);
             if (n++ < 20) printf("nvn_vk: texture unit %u of the %s stage: the shader declares view kind %d, the texture is kind %d (target %d, %d samples): a dummy is bound\n", u, s ? "fragment" : "vertex", dim, have, e.target, vt->samples); }
@@ -2243,11 +2336,11 @@ static int draw_prepare(unsigned prim) {
     {
         static VkWriteDescriptorSet w[320];
         static VkDescriptorBufferInfo bi[120];
-        static VkDescriptorImageInfo ii[200];
         /* buffers change with every draw: pushed into the command buffer (no set, no pool) when the device can; the
-         * textures of a draw repeat: one set per distinct list (layout, views, samplers, image layouts) per command buffer */
+         * textures of a draw repeat: one set per distinct list (layout, views, samplers, image layouts), kept across
+         * command buffers (tc_get; SMO_VK_TSET_CACHE=0: per command buffer) */
         VkDescriptorSet sets[2] = {NULL, NULL};
-        int nw = 0, ib = 0, it = 0;
+        int nw = 0, ib = 0;
         if (!p->push0 && p->nb[0]) sets[0] = set_alloc(p->dl[0]);
         memset(w, 0, sizeof w[0] * (size_t)(p->nb[0] + p->nb[1]));
         for (int s = 0; s < 3; s++) {
@@ -2266,34 +2359,30 @@ static int draw_prepare(unsigned prim) {
         else if (sets[0]) { vkUpdateDescriptorSets(V.device, (uint32_t)nw, w, 0, NULL); vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 1, &sets[0], 0, NULL); }
         if (p->nb[1]) {
             uint64_t key = fnv(0xcbf29ce484222325ULL, &p->dl[1], sizeof p->dl[1]);
-            unsigned slot;
-            if (p->dl[1] == g_udl[1]) for (int s = 0; s < 3; s++) { VStage *v = sv[s]; if (v) for (int i = 0; i < v->nsmp; i++) key = fnv(key, &v->smp[i].binding, sizeof v->smp[i].binding); }      /* one layout for every pipeline: the binding numbers tell the lists apart */
-            for (int i = 0; i < g_ndtex; i++) { key = fnv(key, &g_dtex[i].view, sizeof g_dtex[i].view); key = fnv(key, &g_dtex[i].smp, sizeof g_dtex[i].smp); key = fnv(key, &g_dtex[i].layout, sizeof g_dtex[i].layout); }
+            int hit;
+            TcEnt *tc;
+            key = fnv(key, g_dtex, sizeof g_dtex[0] * (size_t)g_ndtex);      /* views (and their ids), samplers, image layouts, binding numbers (one layout for every pipeline: they tell the lists apart) */
             if (!key) key = 1;
-            for (slot = (unsigned)key & 4095; g_tset[slot].gen == g_tset_gen && g_tset[slot].key != key; slot = (slot + 1) & 4095) {}
-            /* a hash hit is confirmed by comparing the whole list (layout, views, samplers, image layouts); a
-             * different list with the same hash gets a set of its own and is counted */
-            int hit = g_tset[slot].gen == g_tset_gen && g_tset[slot].key == key;
-            if (hit && (g_tset[slot].dl != p->dl[1] || g_tset[slot].n != g_ndtex || memcmp(&g_tset_list[g_tset[slot].off], g_dtex, sizeof g_dtex[0] * (size_t)g_ndtex))) { hit = 0; R.tset_collisions++; slot = 4096; }
-            if (hit) { sets[1] = g_tset[slot].set; R.sets_reused++; }
-            else {
-                int n1 = 0;
-                sets[1] = set_alloc(p->dl[1]);
-                for (int s = 0; s < 3; s++) {
-                    VStage *v = sv[s];
-                    if (!v) continue;
-                    for (int i = 0; i < v->nsmp; i++) {
-                        ii[it].sampler = g_dtex[it].smp; ii[it].imageView = g_dtex[it].view; ii[it].imageLayout = g_dtex[it].layout;
-                        memset(&w[n1], 0, sizeof w[n1]);
-                        w[n1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[n1].dstSet = sets[1]; w[n1].dstBinding = v->smp[i].binding; w[n1].descriptorCount = 1;
-                        w[n1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[n1].pImageInfo = &ii[it]; n1++; it++;
+            if (tc_on() && (tc = tc_get(key, p->dl[1], &hit)) != NULL) {      /* kept across command buffers */
+                if (hit) R.sets_reused++; else tset_write(tc->set);
+                tc->serial = R.serial + 1;             /* the command buffer being recorded: not written again before it has finished */
+                sets[1] = tc->set;
+            } else {
+                unsigned slot;
+                for (slot = (unsigned)key & 4095; g_tset[slot].gen == g_tset_gen && g_tset[slot].key != key; slot = (slot + 1) & 4095) {}
+                /* a hash hit is confirmed by comparing the whole list (layout, views, samplers, image layouts); a
+                 * different list with the same hash gets a set of its own and is counted */
+                hit = g_tset[slot].gen == g_tset_gen && g_tset[slot].key == key;
+                if (hit && (g_tset[slot].dl != p->dl[1] || g_tset[slot].n != g_ndtex || memcmp(&g_tset_list[g_tset[slot].off], g_dtex, sizeof g_dtex[0] * (size_t)g_ndtex))) { hit = 0; R.tset_collisions++; slot = 4096; }
+                if (hit) { sets[1] = g_tset[slot].set; R.sets_reused++; }
+                else {
+                    sets[1] = set_alloc(p->dl[1]);
+                    tset_write(sets[1]);
+                    if (slot < 4096 && g_tset_used < 3000 && g_tset_list_used + g_ndtex <= (int)(sizeof g_tset_list / sizeof g_tset_list[0])) {
+                        g_tset[slot].key = key; g_tset[slot].set = sets[1]; g_tset[slot].gen = g_tset_gen; g_tset[slot].dl = p->dl[1]; g_tset[slot].n = g_ndtex; g_tset[slot].off = g_tset_list_used;
+                        memcpy(&g_tset_list[g_tset_list_used], g_dtex, sizeof g_dtex[0] * (size_t)g_ndtex);
+                        g_tset_list_used += g_ndtex; g_tset_used++;
                     }
-                }
-                vkUpdateDescriptorSets(V.device, (uint32_t)n1, w, 0, NULL);
-                if (slot < 4096 && g_tset_used < 3000 && g_tset_list_used + g_ndtex <= (int)(sizeof g_tset_list / sizeof g_tset_list[0])) {
-                    g_tset[slot].key = key; g_tset[slot].set = sets[1]; g_tset[slot].gen = g_tset_gen; g_tset[slot].dl = p->dl[1]; g_tset[slot].n = g_ndtex; g_tset[slot].off = g_tset_list_used;
-                    memcpy(&g_tset_list[g_tset_list_used], g_dtex, sizeof g_dtex[0] * (size_t)g_ndtex);
-                    g_tset_list_used += g_ndtex; g_tset_used++;
                 }
             }
             vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 1, 1, &sets[1], 0, NULL);
@@ -3619,7 +3708,8 @@ static void vkd_init(void) {
         if (D.f2.features.depthClamp) { X3(vkCmdSetDepthClampEnableEXT) }
 #undef X3
     }
-    printf("nvn_vk: descriptors: buffers (set 0) %s, textures (set 1) one set per distinct binding list per command buffer\n", D.has_push ? "pushed (VK_KHR_push_descriptor)" : "one allocated set per draw");
+    printf("nvn_vk: descriptors: buffers (set 0) %s, textures (set 1) one set per distinct binding list %s\n", D.has_push ? "pushed (VK_KHR_push_descriptor)" : "one allocated set per draw",
+           tc_on() ? "kept across command buffers" : "per command buffer (SMO_VK_TSET_CACHE=0)");
     vkGetPhysicalDeviceMemoryProperties(V.gpu, &D.mp);
     for (int i = 0; i < NSLOT; i++) {
         VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -3712,6 +3802,7 @@ static void vkd_shutdown(void) {
     if (g_ts_pool) { vkDestroyQueryPool(V.device, g_ts_pool, NULL); g_ts_pool = NULL; g_ts_on = 0; }
     if (g_occ_pool) { vkDestroyQueryPool(V.device, g_occ_pool, NULL); g_occ_pool = NULL; g_occ_qn = 0; }
     for (int i = 0; i < NSLOT; i++) { for (int k = 0; k < R.slot[i].npool; k++) vkDestroyDescriptorPool(V.device, R.slot[i].pool[k], NULL); vkDestroyFence(V.device, R.slot[i].fence, NULL); }
+    tc_shutdown();
     vkDestroyBuffer(V.device, R.ring, NULL); vkDestroyBuffer(V.device, R.zero, NULL);
     for (int b = 0; b < g_nblk; b++) if (g_blk[b]) { vkFreeMemory(V.device, g_blk[b]->mem, NULL); free(g_blk[b]); g_blk[b] = NULL; }
     R.ring = NULL;
