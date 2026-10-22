@@ -268,11 +268,15 @@ static void passshot_parse(void) {
     g_ps_lo = g_ps_hi = atoll(e);
     if ((d = strchr(e, '-')) != NULL) { g_ps_hi = atoll(d + 1); if ((d = strchr(d, '/')) != NULL && atoll(d + 1) > 0) g_ps_step = atoll(d + 1); }
 }
-static int passshot_frame(void) {
+/* passshot_frame is asked several times per draw and per sampler: its answer is kept (g_ps_now) and made again at each
+ * batch (vk_submit) and where the frame number changes (vk_present2, after nvn_front_frame_end), not across files each time */
+static int g_ps_now = -1;
+static void passshot_update(void) {
     if (g_ps_lo == -2) passshot_parse();
     long long f = nvn_front_frame_next();
-    return g_ps_lo >= 0 && f >= g_ps_lo && f <= g_ps_hi && (f - g_ps_lo) % g_ps_step == 0;
+    g_ps_now = g_ps_lo >= 0 && f >= g_ps_lo && f <= g_ps_hi && (f - g_ps_lo) % g_ps_step == 0;
 }
+static int passshot_frame(void) { if (g_ps_now < 0) passshot_update(); return g_ps_now; }
 static int passshot_range(void) { if (g_ps_lo == -2) passshot_parse(); return g_ps_hi > g_ps_lo; }
 /* NVN counter type 1, SAMPLES_PASSED (occlusion). Between nvnCommandBufferResetCounter and ReportCounter the
  * samples of every draw are counted. A Vulkan occlusion query begun inside a render pass must end in it, so the count is
@@ -3050,6 +3054,7 @@ static void vk_submit(void *arg) {
     if (g_occ_qn) occ_resolve(0);                  /* occlusion counts whose submissions have finished */
     LONG64 t1 = tk();
     nvn_front_batch_begin();
+    passshot_update();
     GEN_BUMP(GEN_BATCH);                           /* guest memory may have changed since the last batch */
     g_batch_no++;
     if (g_scan_on) {                               /* what this batch will need goes to the workers before it is replayed */
@@ -3584,6 +3589,7 @@ shown:
     if (g_occ_qn) { LONG64 w0 = g_occ_waits; occ_resolve(g_occ_present ? g_occ_qn : 0); g_occ_present_waits += g_occ_waits > w0; }      /* the frame's occlusion counts (read by the game in the next frame) */
     g_tm[4] += tk() - t_present;
     nvn_front_frame_end(R.frame_draws, R.frame_skipped, R.frame_clears);
+    passshot_update();                             /* the next frame */
     { static LONG64 disp_prev; g_in_scene = R.dispatches != disp_prev; disp_prev = R.dispatches; if (g_in_scene) { g_scene_last = frame; g_scene_frames++; } g_frames_counted++; }      /* a frame with compute dispatches: the game draws a scene */
     {   /* per-frame record for the "nvn_vk_gpu_play:" line */
         static LONG64 t_prev;
