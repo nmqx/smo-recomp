@@ -430,8 +430,9 @@ static LONG64 g_ring_waits, g_ring_bytes;
  * or last checked: only a range a write overlaps is copied (or scanned) again. A full log starts a new generation.
  * Counted for the perf line every 300 frames (why: 0 batch, 1 ring wrap, 2 copy-back of compute results, 3 occlusion
  * results, 4 UpdateUniformBuffer, 5 report value or timestamp, 6 buffer copy or clear, 7 texture read into a buffer,
- * 8 write log full, 9 a logged write overlaps the index range of a draw: index_max keeps its cache by generation only). */
-enum { GEN_BATCH, GEN_WRAP, GEN_CB, GEN_OCC, GEN_UBO, GEN_REPORT, GEN_BUF, GEN_TEXBUF, GEN_LOGFULL, GEN_INDEXW, GEN_N };
+ * 8 write log full). A logged write over the index range of a draw used to start one too (index_max kept its cache by
+ * generation only); index_max now checks the log from where it last checked its entry, as ring_put does. */
+enum { GEN_BATCH, GEN_WRAP, GEN_CB, GEN_OCC, GEN_UBO, GEN_REPORT, GEN_BUF, GEN_TEXBUF, GEN_LOGFULL, GEN_N };
 static LONG64 g_gen_why[GEN_N], g_wlog_why[GEN_N];
 #define WLOG_N 1024
 static struct { uint64_t lo, hi; } g_wlog[WLOG_N];
@@ -647,7 +648,7 @@ static LONG64 g_texbar, g_texbar_split, g_texbar_skip;
  * and, for per-instance streams, the highest instance; only inside the game's heap, and by 16 MB at most (else left as
  * bound, counted). SMO_VK_VTXGROW=0: as before; SMO_VK_VTXCHECK=1 logs each kind of draw that reads past its range. */
 static int g_vtxcheck = -1, g_vtxgrow = -1;
-static LONG64 g_vtx_over, g_fr_vtxover, g_vtx_capped, g_imax_scans;
+static LONG64 g_vtx_over, g_fr_vtxover, g_vtx_capped, g_imax_scans, g_imax_written;      /* index_max: scans, scans of a cached range a logged host write overlapped */
 static uint64_t g_vneed[16];                       /* bytes of each vertex stream the next draw reads (0: not known) */
 int smo_heap_section_offset(uint64_t addr, uint64_t size, HANDLE *section, uint64_t *offset);      /* smo_nn.c: inside the game's committed heap? */
 static unsigned vattr_size(int nf) {               /* bytes of one vertex attribute of NVN format nf (as vertex_vkfmt maps it) */
@@ -663,14 +664,19 @@ static void vtx_switches(void) {
     g_vtxcheck = getenv("SMO_VK_VTXCHECK") && atoi(getenv("SMO_VK_VTXCHECK"));
 }
 /* The largest index of [addr, addr + count) of index type t (0 8-bit, 1 16-bit, 2 32-bit), restart indices left out;
- * remembered for the batch (R.gen: guest memory may change between batches). 16 bytes at a time (SSE2: the host code is
+ * remembered for the generation (R.gen: guest memory may change between batches) unless a host write logged since the
+ * entry was last checked overlaps the range (wpos, as ring_put; before, every indexed draw scanned the whole log and a hit
+ * started a new generation). 16384 entries (2048 were too few for the ranges of a scene). 16 bytes at a time (SSE2: the host code is
  * built at -O1, which does not vectorize): one index at a time it was 7% of the render thread in Cascade Kingdom, about
  * 1.2 ms a frame. Unsigned maxima: bytes directly, 16- and 32-bit indices with the top bit flipped compared as signed;
  * a restart index counts as 0. */
 static uint32_t index_max(uint64_t addr, int count, unsigned t) {
-    static struct { uint64_t addr; uint32_t gen, maxi; int n; uint8_t t, rs; } c[2048];
-    unsigned h = (unsigned)(((addr >> 1) ^ (uint64_t)count * 0x9E3779B1u) * 2654435761u) >> 21;
-    if (c[h].addr == addr && c[h].n == count && c[h].t == (uint8_t)t && c[h].gen == R.gen && c[h].rs == (uint8_t)R.restart) return c[h].maxi;
+    static struct { uint64_t addr; uint32_t gen, maxi, wpos; int n; uint8_t t, rs; } c[16384];      /* wpos: host writes logged up to here were checked */
+    unsigned h = (unsigned)(((addr >> 1) ^ (uint64_t)count * 0x9E3779B1u) * 2654435761u) >> 18;
+    if (c[h].addr == addr && c[h].n == count && c[h].t == (uint8_t)t && c[h].gen == R.gen && c[h].rs == (uint8_t)R.restart) {
+        if (c[h].wpos == g_wlog_n || !wlog_overlap(c[h].wpos, addr, addr + ((uint64_t)(uint32_t)count << t))) { c[h].wpos = g_wlog_n; return c[h].maxi; }
+        g_imax_written++;                          /* the host wrote into the indices since: scanned again */
+    }
     const uint8_t *src = P(addr);
     uint32_t mx = 0;
     int k = 0, per = 16 >> t;                      /* indices in 16 bytes */
@@ -699,7 +705,7 @@ static uint32_t index_max(uint64_t addr, int count, unsigned t) {
     if (t == 0) { for (; k < count; k++) { uint32_t v = src[k]; if (v > mx && !(R.restart && v == 0xFFu)) mx = v; } }
     else if (t == 1) { const uint16_t *p16 = (const uint16_t *)src; for (; k < count; k++) { uint32_t v = p16[k]; if (v > mx && !(R.restart && v == 0xFFFFu)) mx = v; } }
     else { const uint32_t *p32 = (const uint32_t *)src; for (; k < count; k++) { uint32_t v = p32[k]; if (v > mx && !(R.restart && v == 0xFFFFFFFFu)) mx = v; } }
-    c[h].addr = addr; c[h].n = count; c[h].t = (uint8_t)t; c[h].gen = R.gen; c[h].rs = (uint8_t)R.restart; c[h].maxi = mx;
+    c[h].addr = addr; c[h].n = count; c[h].t = (uint8_t)t; c[h].gen = R.gen; c[h].rs = (uint8_t)R.restart; c[h].maxi = mx; c[h].wpos = g_wlog_n;
     g_imax_scans++;
     return mx;
 }
@@ -2699,7 +2705,6 @@ static void vk_draw_quads(uint32_t first, uint32_t count, unsigned type, uint64_
     if (indices && g_cb_live && cb_overlap(indices, (uint64_t)count << t)) CB_SYNC(6);      /* the indices are read from guest memory: compute results there first */
     uint64_t off = quad_indices(indices, t, count, &n);
     vtx_switches();
-    if (indices && g_wlog_n && wlog_overlap(0, indices, indices + ((uint64_t)count << t))) GEN_BUMP(GEN_INDEXW);      /* index_max's cache knows generations only */
     if (indices) { int64_t mv = (int64_t)index_max(indices, (int)count, t) + base_vertex; vtx_need(mv > 0 ? (uint64_t)mv : 0, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 1); }
     else vtx_need((uint64_t)first + count - 1, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 0);
     { LONG64 t0 = tk(); int ok = draw_prepare(4 /* NVN_DRAW_PRIMITIVE_TRIANGLES */); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
@@ -2733,7 +2738,6 @@ static void vk_draw_elements(unsigned prim, unsigned type, int count, uint64_t i
     if (g_cb_live && cb_overlap(indices, (uint64_t)count << t)) CB_SYNC(6);      /* index_max reads the indices from guest memory: compute results there first */
     buf_ref(indices, (uint64_t)count << t, (uint64_t)1 << t, &ib);    /* before the draw is prepared: a ring wrap submits */
     vtx_switches();
-    if (g_wlog_n && wlog_overlap(0, indices, indices + ((uint64_t)count << t))) GEN_BUMP(GEN_INDEXW);      /* index_max's cache knows generations only */
     {   int64_t mv = (int64_t)index_max(indices, count, t) + base_vertex;
         vtx_need(mv > 0 ? (uint64_t)mv : 0, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 1); }
     { LONG64 t0 = tk(); int ok = draw_prepare(prim); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
@@ -3620,14 +3624,14 @@ shown:
         if (g_gs_draws) printf("nvn_vk_gs: frames %lld..%lld: draws with a geometry stage so far %lld, their pipelines %lld\n", (long long)frame - 300, (long long)frame, (long long)g_gs_draws, (long long)g_gs_pipes);
         { static LONG64 sp_last; if (g_sync_pending_cb != sp_last) printf("nvn_vk_sync: frames %lld..%lld: %lld fence waits found compute results not yet in guest memory (landed before returning)\n", (long long)frame - 300, (long long)frame, (long long)(g_sync_pending_cb - sp_last)); sp_last = g_sync_pending_cb; }
         { static LONG64 vs_last; printf("nvn_vk_vstage: frames %lld..%lld: %.1f stage lookups a frame missed the stage's last variant (%d samplers made)\n", (long long)frame - 300, (long long)frame, (double)(g_vstage_slow - vs_last) / 300.0, g_nsmp); vs_last = g_vstage_slow; }
-        {   static LONG64 lg[GEN_N], lw[GEN_N], lcalls, lhits, lagain, lagain_b, lbytes;
+        {   static LONG64 lg[GEN_N], lw[GEN_N], lcalls, lhits, lagain, lagain_b, lbytes, limaxw;
             double g[GEN_N], w[GEN_N];
             for (int i = 0; i < GEN_N; i++) { g[i] = (double)(g_gen_why[i] - lg[i]) / 300.0; w[i] = (double)(g_wlog_why[i] - lw[i]) / 300.0; }
-            printf("nvn_vk_ring: frames %lld..%lld per frame: streamed %.2f MB, ring_put %.0f calls (%.1f%% cached), copied again within a batch %.0f ranges %.2f MB | new generations: batch %.1f, wrap %.2f, texture to buffer %.2f, write log full %.2f, index range written %.2f | host writes logged: copy-back %.1f, occlusion %.1f, UpdateUniformBuffer %.1f, report %.1f, buffer copy/clear %.1f\n",
+            printf("nvn_vk_ring: frames %lld..%lld per frame: streamed %.2f MB, ring_put %.0f calls (%.1f%% cached), copied again within a batch %.0f ranges %.2f MB | new generations: batch %.1f, wrap %.2f, texture to buffer %.2f, write log full %.2f | index ranges scanned again after a host write into them %.2f | host writes logged: copy-back %.1f, occlusion %.1f, UpdateUniformBuffer %.1f, report %.1f, buffer copy/clear %.1f\n",
                    (long long)frame - 300, (long long)frame, (double)(g_ring_bytes - lbytes) / 1048576.0 / 300.0, (double)(g_rput_calls - lcalls) / 300.0,
                    g_rput_calls > lcalls ? 100.0 * (double)(g_rput_hits - lhits) / (double)(g_rput_calls - lcalls) : 0.0, (double)(g_rput_again - lagain) / 300.0, (double)(g_rput_again_bytes - lagain_b) / 1048576.0 / 300.0,
-                   g[GEN_BATCH], g[GEN_WRAP], g[GEN_TEXBUF], g[GEN_LOGFULL], g[GEN_INDEXW], w[GEN_CB], w[GEN_OCC], w[GEN_UBO], w[GEN_REPORT], w[GEN_BUF]);
-            memcpy(lg, g_gen_why, sizeof lg); memcpy(lw, g_wlog_why, sizeof lw); lcalls = g_rput_calls; lhits = g_rput_hits; lagain = g_rput_again; lagain_b = g_rput_again_bytes; lbytes = g_ring_bytes;
+                   g[GEN_BATCH], g[GEN_WRAP], g[GEN_TEXBUF], g[GEN_LOGFULL], (double)(g_imax_written - limaxw) / 300.0, w[GEN_CB], w[GEN_OCC], w[GEN_UBO], w[GEN_REPORT], w[GEN_BUF]);
+            memcpy(lg, g_gen_why, sizeof lg); memcpy(lw, g_wlog_why, sizeof lw); lcalls = g_rput_calls; lhits = g_rput_hits; lagain = g_rput_again; lagain_b = g_rput_again_bytes; lbytes = g_ring_bytes; limaxw = g_imax_written;
         }
         if (frame % 3000 == 0) pipelines_report();
         mem_report(frame);
