@@ -94,6 +94,28 @@ static void sampler_sort(Ctx *c) {
     free(before); free(mine);
 }
 
+/* registerSampler_(this = x0, index = w1, sampler = x2, key = w3) [main] begins:
+ *     x9 = this->slots (+0x160); w8 = this->count (+0x158); x10 = x9 + (int32)w1 * 0x68
+ *     slot = count > index (unsigned) ? x10 : x9;  if (slot->refs (+0x60, u16)) return -1
+ * The game's registerSampler looks for a free slot by calling it for one index after another from a cursor (next fit),
+ * and in New Donk City the table holds thousands of samplers, nearly all taken: thousands of lifted calls for one new
+ * sampler, a fifth of the main thread's time there (SMO_HOSTPROF). Here the taken slot is answered in host code with
+ * what the game's code leaves behind (w0 = -1; x8, x9, x10 as it sets them; the callee-saved registers it restores);
+ * a free slot goes to the lifted function. */
+static void (*g_lifted_register)(Ctx *);
+static LONG64 g_reg_taken, g_reg_free;
+static void sampler_register(Ctx *c) {
+    uint64_t self = c->x[0], slots = rd64(self + 0x160);
+    uint32_t count = rd32(self + 0x158), index = (uint32_t)c->x[1];
+    uint64_t at = slots + (uint64_t)((int64_t)(int32_t)index * 0x68);
+    uint64_t slot = count > index ? at : slots;
+    uint32_t refs = rd16(slot + 0x60);
+    if (!refs) { g_reg_free++; g_lifted_register(c); return; }
+    g_reg_taken++;
+    c->x[8] = refs; c->x[9] = slots; c->x[10] = at;
+    c->x[0] = 0xffffffffu;                       /* mov w21, #-1 ... mov w0, w21: the upper half is zero */
+}
+
 /* A page within 2 GB of `site` for the jump stub (a rel32 must reach it). */
 static uint8_t *alloc_near(uint8_t *site) {
     uintptr_t base = (uintptr_t)site & ~(uintptr_t)0xffff;
@@ -106,6 +128,48 @@ static uint8_t *alloc_near(uint8_t *site) {
         }
     }
     return NULL;
+}
+
+/* Every direct call of the lifted registerSampler_ in the game DLL's code goes to sampler_register (through one stub). */
+static void install_register(void) {
+    g_lifted_register = host_fn_of(SYM_REGISTER);
+    if (!g_lifted_register) { printf("smo_fast: registerSampler_'s free-slot test NOT installed: the lifted function was not found\n"); return; }
+    HMODULE m = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)g_lifted_register, &m);
+    if (!m) return;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((uint8_t *)m + ((IMAGE_DOS_HEADER *)m)->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    uint8_t *target = (uint8_t *)(uintptr_t)g_lifted_register, *stub = NULL;
+    int sites = 0, patched = 0;
+    for (int s = 0; s < nt->FileHeader.NumberOfSections; s++) {
+        if (!(sec[s].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        uint8_t *q = (uint8_t *)m + sec[s].VirtualAddress, *end = q + sec[s].Misc.VirtualSize;
+        for (; q + 5 <= end; q++) {
+            int32_t rel;
+            if (q[0] != 0xE8) continue;
+            memcpy(&rel, q + 1, 4);
+            if (q + 5 + rel != target) continue;
+            sites++;
+            if (!stub) {
+                static const uint8_t jmp_abs[6] = {0xFF, 0x25, 0, 0, 0, 0};
+                void (*fn)(Ctx *) = sampler_register;
+                DWORD old;
+                if (!(stub = alloc_near(q))) break;
+                memcpy(stub, jmp_abs, 6); memcpy(stub + 6, &fn, 8);
+                VirtualProtect(stub, 0x1000, PAGE_EXECUTE_READ, &old);
+            }
+            int64_t rel64 = stub - (q + 5);
+            DWORD old;
+            if (rel64 != (int32_t)rel64 || !VirtualProtect(q + 1, 4, PAGE_EXECUTE_READWRITE, &old)) continue;
+            rel = (int32_t)rel64;
+            memcpy(q + 1, &rel, 4);
+            VirtualProtect(q + 1, 4, old, &old);
+            FlushInstructionCache(GetCurrentProcess(), q, 5);
+            patched++;
+            q += 4;
+        }
+    }
+    printf("smo_fast: registerSampler_'s taken-slot answer in host code at %d of %d call sites (the free-slot search of registerSampler)\n", patched, sites);
 }
 
 void smo_fast_install(void) {
@@ -148,9 +212,12 @@ void smo_fast_install(void) {
     FlushInstructionCache(GetCurrentProcess(), at, 5);
     printf("smo_fast: agl::driver::NVNMgr::registerSampler_ sorts its sampler list in host code (SMO_FAST=0: the game's own code%s)\n",
            g_check ? "; SMO_FAST_CHECK=1: every sort compared with the game's" : ", SMO_FAST_CHECK=1: compare with it");
+    install_register();
 }
 
 void smo_fast_report(FILE *out) {
+    if (g_reg_taken || g_reg_free) fprintf(out, "smo_fast: registerSampler_ calls: %lld on a taken slot answered in host code, %lld on a free slot passed to the game's code\n",
+                                            (long long)g_reg_taken, (long long)g_reg_free);
     if (!g_sorts && !g_other) return;
     fprintf(out, "smo_fast: sampler list sorts in host code: %lld (%lld entries in all, %lld swaps); calls with another comparator, passed to the game's sort: %lld\n",
             (long long)g_sorts, (long long)g_items, (long long)g_swaps, (long long)g_other);

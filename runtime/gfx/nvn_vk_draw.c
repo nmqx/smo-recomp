@@ -305,6 +305,18 @@ static uint64_t vk_now_ns(void) {
     QueryPerformanceCounter(&t);
     return (uint64_t)(t.QuadPart / f.QuadPart) * 1000000000ull + (uint64_t)(t.QuadPart % f.QuadPart) * 1000000000ull / (uint64_t)f.QuadPart;
 }
+/* The time written into the game's counter reports (timestamps). They are taken when the render thread replays the report,
+ * so the time between two of them is the replay's CPU time, not the GPU's: in New Donk City 15 ms of a 16.7 ms frame,
+ * against 4.5 ms of real GPU work, and the game's dynamic resolution then renders the scene far smaller. A clock that runs
+ * at SMO_VK_REPORT_TIME_SCALE (1.0 = real time) from the first report on keeps the reports in order and makes their
+ * differences that much smaller. */
+static uint64_t report_ns(void) {
+    static double scale = -1.0;
+    static uint64_t t0;
+    if (scale < 0) { const char *e = getenv("SMO_VK_REPORT_TIME_SCALE"); scale = e && atof(e) > 0 ? atof(e) : 0.25; t0 = vk_now_ns(); }
+    uint64_t n = vk_now_ns();
+    return scale == 1.0 ? n : t0 + (uint64_t)((double)(n - t0) * scale);
+}
 /* SMO_VK_GPUTIME=1: two timestamp queries per command buffer (written at its first and after its last command),
  * read when the buffer has finished; "nvn_vk_gpu:" line every 300 frames. The span of a buffer includes the time the GPU
  * gave to other processes while it ran. */
@@ -1648,7 +1660,7 @@ static void occ_resolve(int need) {
         if (e->kind == 1) g_occ_total = 0;
         else g_occ_total += sum;
         if (e->kind == 0 && e->dst) {
-            uint64_t d[2] = {g_occ_total, vk_now_ns()};
+            uint64_t d[2] = {g_occ_total, report_ns()};
             memcpy(P(e->dst), d, 16);
             host_wrote(e->dst, 16, GEN_OCC);      /* ranges the ring copied from there are copied again */
             if (nvn_front_frame_next() > e->frame) g_occ_late++;
@@ -2664,7 +2676,7 @@ static void exec(const Cmd *m, int depth) {
     /* reports, as nvn_gl.c's replay writes them (NVNcounterData {counter, timestamp in ns}), after the work
      * recorded before them has run (cb_sync). Counter type 0 carries only the timestamp; types measured by the GPU
      * (samples passed, primitives, shader invocations: Vulkan queries) are not implemented yet and stop with the type. */
-    case OP_REPORT_VALUE: if (a[1]) { cb_sync(); uint64_t d[2] = {(uint32_t)a[0], vk_now_ns()}; memcpy(P(a[1]), d, 16); host_wrote(a[1], 16, GEN_REPORT); } break;
+    case OP_REPORT_VALUE: if (a[1]) { cb_sync(); uint64_t d[2] = {(uint32_t)a[0], report_ns()}; memcpy(P(a[1]), d, 16); host_wrote(a[1], 16, GEN_REPORT); } break;
     /* NVN counter types: 0 TIMESTAMP (bottom of pipe: after earlier work), 16 TIMESTAMP_TOP (top of pipe: when reached,
      * no wait); 1..15 are measured by the GPU (samples passed ... ZCULL stats), as nvn_gl.c's counter_target lists */
     case OP_COUNTER_RESET: if (a[0] == 1) { occ_reset(); break; } if (a[0] != 0 && a[0] != 16) { static char msg[80]; snprintf(msg, sizeof msg, "nvnCommandBufferResetCounter of counter type %u (a GPU query)", (unsigned)a[0]); nvn_vk_missing(msg); } break;
@@ -2673,11 +2685,11 @@ static void exec(const Cmd *m, int depth) {
         if (a[0] >= 2 && a[0] <= 15) {             /* a pipeline statistics counter (vertices, invocations, primitives, zcull; profiling): reported as 0 with the time */
             static uint32_t said;
             if (!(said >> a[0] & 1)) { said |= 1u << a[0]; printf("nvn_vk: nvnCommandBufferReportCounter of counter type %u (pipeline statistics): reported as 0 (not counted)\n", (unsigned)a[0]); }
-            if (a[1]) { uint64_t d[2] = {0, vk_now_ns()}; memcpy(P(a[1]), d, 16); host_wrote(a[1], 16, GEN_REPORT); }
+            if (a[1]) { uint64_t d[2] = {0, report_ns()}; memcpy(P(a[1]), d, 16); host_wrote(a[1], 16, GEN_REPORT); }
             break;
         }
         if (a[0] != 0 && a[0] != 16) { static char msg[80]; snprintf(msg, sizeof msg, "nvnCommandBufferReportCounter of counter type %u (a GPU query)", (unsigned)a[0]); nvn_vk_missing(msg); break; }
-        if (a[1]) { if (a[0] == 0) cb_sync(); uint64_t d[2] = {0, vk_now_ns()}; memcpy(P(a[1]), d, 16); host_wrote(a[1], 16, GEN_REPORT); }
+        if (a[1]) { if (a[0] == 0) cb_sync(); uint64_t d[2] = {0, report_ns()}; memcpy(P(a[1]), d, 16); host_wrote(a[1], 16, GEN_REPORT); }
         break;
     case OP_CONSRASTER: if (a[0] & 1) nvn_vk_missing("conservative rasterisation (nvnCommandBufferSetConservativeRasterEnable)"); break;
     case OP_DEPTHBOUNDS: if (a[0] & 1) nvn_vk_missing("the depth bounds test (nvnCommandBufferSetDepthBounds)"); break;

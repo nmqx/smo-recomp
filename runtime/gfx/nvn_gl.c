@@ -4804,7 +4804,7 @@ static void queue_present(Ctx *c) {                     /* (queue, window, textu
     if (g_tl_on) nvn_tl(TL_PRESENT_CALL, 0);
     g_pf_main_tid = GetCurrentThreadId();
     display_before_present();
-    if (g_present_sync < 0) g_present_sync = !(getenv("SMO_PRESENT_ASYNC") && atoi(getenv("SMO_PRESENT_ASYNC"))) || !gl_async_on();
+    if (g_present_sync < 0) g_present_sync = (getenv("SMO_PRESENT_ASYNC") && !atoi(getenv("SMO_PRESENT_ASYNC"))) || !gl_async_on();      /* async by default: the game draws the next frame while this one is replayed (New Donk City: 38-42 -> 44-54 fps); SMO_PRESENT_ASYNC=0: wait as before */
     if (g_present_sync) gl_run(g_rb->present, &j);
     else {
         if (!g_present_ev) g_present_ev = CreateEventA(NULL, FALSE, FALSE, NULL);

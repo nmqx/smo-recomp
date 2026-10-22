@@ -118,7 +118,9 @@ about 3 minutes on 12 threads, link 1 minute).
    .venv\Scripts\python scripts\setup.py --dump "<dump>"
    ```
    `--only deps` names anything missing. The setup resumes where it stopped if interrupted; after changing only the
-   runtime, `--only link` is enough.
+   runtime, `--only link` is enough. Optional, for a build tuned to your CPU (it then runs on that CPU family and later
+   ones only): `set RECOMP_ARCH=-march=znver2 -mno-prfchw` (Zen 2; `-march=native` for whatever CPU builds it) before
+   `setup.py`.
 4. **Play:**
    ```bat
    .venv\Scripts\python scripts\run.py play --exe smo_native.exe --seconds 0
@@ -149,10 +151,28 @@ about 3 minutes on 12 threads, link 1 minute).
   `SMO_HOST_CPUS=<hex>` chooses).
 - **Shader cache fix** (`runtime/gfx/nvn_vk_pipelines.c`): `..\cache\vk` was made with one `CreateDirectory` call,
   which fails when `build\cache` does not exist yet, so a fresh build compiled every shader again at every start.
+- **Speed in heavy places** (measured in New Donk City's streets, about 2,000 draws a frame, Ryzen 5 3600XT, RTX 3090):
+
+  | Change | fps there |
+  |---|---|
+  | as forked (lifted code and runtime at `-O1`) | about 20 |
+  | lifted code at `-O2` (now the default, `RECOMP_OPT`), `RECOMP_ARCH=-march=znver2` | 30-36 |
+  | registerSampler_'s free-slot search answered in host code (`smo_fast.c`; the game probes thousands of taken sampler slots per new sampler, each a lifted call: half the main thread's time there) | 38-42 |
+  | present without waiting for the replay (`SMO_PRESENT_ASYNC`, now on by default; `=0` waits as before): the game draws the next frame while this one is replayed | 44-54 |
+
+  The runtime is `-O2` too (`RECOMP_HOST_OPT`). `RECOMP_ARCH` (for example `-march=znver2`; add `-mno-prfchw` with
+  clang 9 and a recent Windows SDK, whose `winnt.h` clashes with clang 9's `_m_prefetchw`) makes a build for that CPU
+  family and later ones only. Changing these flags recompiles nothing by itself: run
+  `tools\lifter\build_main.py <jobs> --force` and delete `build\obj\host` before `setup.py --only link`.
+- **Resolution in heavy places**: the game's counter timestamps are taken when the render thread replays them, so the
+  game saw the replay's CPU time (15 ms in New Donk City) as GPU time (4.5 ms there) and its dynamic resolution rendered
+  the scene far smaller. They now come from a clock running at a quarter of real time (`SMO_VK_REPORT_TIME_SCALE`, default
+  0.25; 1.0 as before), and the scene stays sharp.
 
 Measured with `SMO_HITCH=25` on the same scripted 4-minute route (a new game's opening, Ryzen 5 3600XT, RTX 3090):
 frames that missed the 60 Hz refresh by more than 25 ms, 173 without interpolation, 91 with it (and 78 of those bridged on
-screen by predicted frames). The heaviest places (New Donk City's streets) are still CPU-bound on a 6-core Zen 2.
+screen by predicted frames). The heaviest places (New Donk City's streets) are still bound by the render thread's replay
+(about 15 ms a frame there) on a 6-core Zen 2.
 
 ## Repository layout
 
