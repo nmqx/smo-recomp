@@ -300,7 +300,7 @@ static OccEntry g_occ_q[OCC_Q];
 static int g_occ_qh, g_occ_qn;                     /* oldest entry, entries queued */
 static uint64_t g_occ_total;                       /* samples of the count the resolved entries belong to */
 static int g_occ_sync = -1, g_occ_present = -1;
-static LONG64 g_occ_reports, g_occ_waits, g_occ_wait_ticks, g_occ_folds, g_occ_cond, g_occ_cond_waits, g_occ_present_waits, g_occ_late;
+static LONG64 g_occ_reports, g_occ_waits, g_occ_wait_ticks, g_occ_folds, g_occ_cond, g_occ_cond_waits, g_occ_cond_late, g_occ_present_waits, g_occ_late;
 static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (uint32_t)((g_occ_head - 1) % OCC_MAX)); g_occ_open = 0; } }
 static void pass_end(void) { if (R.in_pass) { occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot(); } }
 static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
@@ -764,7 +764,7 @@ static float rs_scale(void) {
         const char *e = getenv("SMO_VK_SCALE");
         float v = e && atof(e) > 0 ? (float)atof(e) : gfx_options()->scale;
         if (v < 0.25f) v = 0.25f;
-        if (v > 1.0f) v = 1.0f;                    /* above 1.0 (supersampling) is not offered: not tested */
+        if (v > 3.0f) v = 3.0f;                    /* above 1.0: supersampling (1.2 = 1920x1080, 1.6 = 2560x1440, 2.4 = 3840x2160) */
         g_rs = v;
     }
     return g_rs;
@@ -3117,8 +3117,21 @@ static void exec(const Cmd *m, int depth) {
                            nvn_front_frame_next(), (unsigned long long)a[2], (long long)e->frame, need, g_occ_qn, (unsigned long long)e->lo, (unsigned long long)e->hi,
                            e->serial > R.serial ? "in the command buffer being recorded" : "submitted");
                 }
-                g_occ_cond_waits++;
-                occ_resolve(need);
+                /* SMO_VK_OCC_LATE (default 1): what the GPU has finished is written to guest memory without waiting; if a
+                 * report the comparison needs is still being counted by the GPU, the comparison uses what guest memory
+                 * holds, the counts the game's previous frame left at those addresses, instead of waiting (about 0.6 such
+                 * waits a frame in New Donk City: 1 ms a frame at the game's own resolution, 5 ms at 1.6). That
+                 * occlusion test then answers one frame late, as asynchronous occlusion queries do in PC games.
+                 * 0: wait, as before. */
+                static int late = -1;
+                if (late < 0) late = !(getenv("SMO_VK_OCC_LATE") && !atoi(getenv("SMO_VK_OCC_LATE")));
+                if (late) {
+                    occ_resolve(0);
+                    int still = 0;
+                    for (int i = 0; i < g_occ_qn && !still; i++) { const OccEntry *e = &g_occ_q[(g_occ_qh + i) % OCC_Q]; still = e->kind == 0 && e->dst < a[2] + 32 && e->dst + 16 > a[2]; }
+                    if (still) g_occ_cond_late++;
+                }
+                else { g_occ_cond_waits++; occ_resolve(need); }
             }
             CB_SYNC(9); int eq = a[2] && rd64(a[2]) == rd64(a[2] + 16); R.render_off = a[1] == 1 ? !eq : eq;
             g_fr_cond++; g_fr_condoff += R.render_off; g_fr_condhash = (g_fr_condhash ^ (a[2] * 2 + (uint64_t)R.render_off)) * 1099511628211ull;
@@ -4206,9 +4219,9 @@ static void vkd_shutdown(void) {
            texfree_frames(), (long long)g_rc_freed, (long long)g_rc_freed_mb, g_rc_n, (long long)g_rc_again, (long long)g_rc_late);
     if (g_occ_reports || g_occ_folds) {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
-        printf("nvn_vk: occlusion counts: %lld reports (%lld written after their frame was presented), %lld compared by a conditional render (%lld of them waited for); "
+        printf("nvn_vk: occlusion counts: %lld reports (%lld written after their frame was presented), %lld compared by a conditional render (%lld of them waited for, %lld answered from the last frame's counts: SMO_VK_OCC_LATE); "
                "%lld waits for the GPU, %.0f ms in all (%lld at a present%s); %lld long counts folded%s\n", (long long)g_occ_reports, (long long)g_occ_late, (long long)g_occ_cond,
-               (long long)g_occ_cond_waits, (long long)g_occ_waits, (double)g_occ_wait_ticks * 1000.0 / (double)fq.QuadPart, (long long)g_occ_present_waits,
+               (long long)g_occ_cond_waits, (long long)g_occ_cond_late, (long long)g_occ_waits, (double)g_occ_wait_ticks * 1000.0 / (double)fq.QuadPart, (long long)g_occ_present_waits,
                g_occ_present ? "" : ", off: SMO_VK_OCC_PRESENT=0", (long long)g_occ_folds, g_occ_sync ? "; SMO_VK_OCC_SYNC=1: each report waited for" : "");
     }
 }
