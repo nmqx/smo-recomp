@@ -52,6 +52,8 @@ typedef struct Tex {
     volatile LONG reclaim;                 /* 1 while the Vulkan back end holds it on its list of textures nothing names (nvn_front_take_unref) */
     long long last_use;                    /* Vulkan back end: the frame it was last used in (vt_get2) */
     int image_freed;                       /* Vulkan back end: its image was freed because nothing named it (a later use makes the image again) */
+    volatile LONG prep_state;              /* nvn_vk_draw.c texture preparation: 0 none, 1 queued, 2 being prepared, 3 ready (prep), 4 dropped, 5 used */
+    void *prep;                            /* its texels as the upload takes them, made by the preparation thread */
 } Tex;
 Tex *nvn_front_tex_first(void);            /* the newest texture record; ->all_next = the one made before it (records are never freed) */
 typedef struct { Tex *tex; View view; int held; } TexPoolEnt;      /* held: the entry counts in tex->nslots (agl has not released the slot) */
@@ -140,6 +142,7 @@ void nvn_front_tex_rehash(Tex *t);                                          /* t
  * every level into RGBA8 with tex_decode_rgba8 (rgba8 = 1 in the call). Returns 0 when the memory is not readable. */
 typedef void nvn_front_put_fn(Tex *t, int level, int layer, int w, int h, int d, const void *data, size_t size, int rgba8, int64_t row_stride);
 int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put);
+int nvn_front_tex_read2(Tex *t, int decode, nvn_front_put_fn *put, uint8_t **tmp, size_t *cap);      /* any thread: the work buffer is the caller's */
 /* Texture pool / sampler pool lookup of an NVN texture handle: returns bit 0 = live texture (*t, *v), bit 1 = sampler (*p). */
 const char *nvn_front_handle_why(TexPool *tp, uint64_t nh);   /* debug aid */
 int nvn_front_handle(TexPool *tp, SamplerPool *sp, uint64_t nh, Tex **t, View *v, SamplerParams *p);

@@ -5494,6 +5494,12 @@ int nvn_front_tex_changed(Tex *t) {
 int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
     static uint8_t *tmp;
     static size_t tmp_cap;
+    return nvn_front_tex_read2(t, decode, put, &tmp, &tmp_cap);
+}
+/* the same with the caller's work buffer: any thread (nvn_vk_draw.c prepares textures on a thread of its own) */
+int nvn_front_tex_read2(Tex *t, int decode, nvn_front_put_fn *put, uint8_t **tmpp, size_t *capp) {
+    uint8_t *tmp = *tmpp;
+    size_t tmp_cap = *capp;
     Fmt f;
     TexBuilder *b = &t->b;
     const uint8_t *src = b->packaged ? P(b->packaged) : t->mem;
@@ -5513,7 +5519,7 @@ int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
             const uint8_t *p = tex_level_ptr(&L, src, l, layer);
             size_t lin = L.lvl_linear_size[l], need = lin + (decode ? (size_t)L.lvl_w[l] * L.lvl_h[l] * 4 : 0);
             if (!b->packaged && t->limit && p + L.lvl_size[l] > t->limit) return 0;
-            if (need > tmp_cap) { tmp_cap = need * 2; tmp = realloc(tmp, tmp_cap); }
+            if (need > tmp_cap) { tmp_cap = need * 2; tmp = realloc(tmp, tmp_cap); *tmpp = tmp; *capp = tmp_cap; }
             tex_deswizzle_level(&L, l, p, tmp);
             if (decode) {
                 tex_decode_rgba8(b->format, tmp, L.lvl_w[l], L.lvl_h[l], tmp + lin);

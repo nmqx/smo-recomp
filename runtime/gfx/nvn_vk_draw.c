@@ -1125,6 +1125,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         t->image_freed = 0;
         if (t->nslots <= 0 && InterlockedCompareExchange(&t->reclaim, 1, 0) == 0) rc_take(t);      /* still nothing names it: it may go again */
     }
+    int vt_new = !vt;
     if (!vt) {
         tu0 = tk();
         TexBuilder *b = &t->b;
@@ -1203,11 +1204,16 @@ static VTex *vt_get2(Tex *t, int sync) {
         if (!tu0) tu0 = tk();
         g_put_vt = vt;
         cmd_begin();
-        if (!nvn_front_tex_read(t, vt->decode, vt_put)) { static int n; if (n++ < 20) printf("nvn_vk: texture %dx%d format 0x%x: its memory is not readable; not uploaded\n", t->b.width, t->b.height, t->b.format); }
+        if (!prep_take(t) && !nvn_front_tex_read(t, vt->decode, vt_put)) { static int n; if (n++ < 20) printf("nvn_vk: texture %dx%d format 0x%x: its memory is not readable; not uploaded\n", t->b.width, t->b.height, t->b.format); }
         R.uploads++;
     }
     if (tu0 && !g_ta_inside) {                     /* made or read again at its use (a draw, a copy, a target): the frame pays */
         LONG64 d = tk() - tu0;
+        if (holdlog_on() && R.upload_bytes - ub0 > (256 << 10)) {      /* debug aid (SMO_VK_HOLDLOG): which textures the frame paid for */
+            static int nl;
+            if (nl++ < 400) printf("nvn_vk_upl1: frame %lld tex %p %dx%d fmt 0x%x pool 0x%x %llu KB %s, ahead %lld prep %ld nregs %d\n", (long long)g_cur_frame, (void *)t, t->b.width, t->b.height,
+                                   t->b.format, t->pool_flags, (unsigned long long)((R.upload_bytes - ub0) >> 10), vt_new ? "new image" : "read again", t->ahead_seen, t->prep_state, t->nregs);
+        }
         g_up_fr_tk += d; g_up_fr_n++; g_up_fr_bytes += R.upload_bytes - ub0;
         g_late_n++; g_late_tk += d;
         if (g_in_scene) { g_late_scene_n++; g_late_scene_tk += d; }
@@ -1227,6 +1233,108 @@ static int scene_recent(void);                     /* nvn_vk_pipelines.c */
 static void present_progress(float frac);          /* the held loading screen presented again with the progress bar (defined above vk_present) */
 static LONG64 g_ovl_presents;                      /* extra presents of a held loading screen */
 static int holdlog_on(void);
+/* ---- textures prepared on a thread of their own (SMO_VK_TEXPREP=1; off by default)
+ * While the game is played, a texture over 512 KB or decoded on the CPU (ASTC on a GPU without it) was made at its first
+ * use: the game streams textures as the camera turns (2,204 images freed, 6.6 GB, in two minutes at the top of New Donk
+ * City's tallest building) and about 19 of them a time, 47 MB, cost the render thread 30 ms (1% lows of 20 fps). Their
+ * texels are now read, deswizzled and decoded by a preparation thread as soon as tex_ahead sees them (in memory pools
+ * the CPU cannot write without telling, so what was read stays true; others are left as before); the first use only
+ * copies the prepared texels into the stream ring. A preparation not used within 1,200 frames is freed. */
+typedef struct { int level, layer, w, h, d, rgba8; int64_t stride; size_t off, size; } PrepEnt;
+typedef struct { uint8_t *buf; size_t len, cap; PrepEnt *e; int n, ncap; LONG64 frame; } Prep;
+static __declspec(thread) Prep *tl_prep;
+#define PQ_N 1024
+static struct { Tex *t; int decode; } g_pq[PQ_N];
+static int g_pq_h, g_pq_n, g_prep_on = -1;
+static SRWLOCK g_pq_lock = SRWLOCK_INIT;
+static HANDLE g_pq_ev;
+static Tex *g_prep_ready[4096];                   /* render thread: textures with a preparation not used yet */
+static int g_prep_nready;
+static volatile LONG64 g_prep_made, g_prep_bytes, g_prep_tk;
+static LONG64 g_prep_used, g_prep_waited, g_prep_freed;
+static void prep_put(Tex *t, int level, int layer, int w, int h, int d, const void *data, size_t size, int rgba8, int64_t stride) {
+    Prep *p = tl_prep;
+    (void)t;
+    if (p->len + size > p->cap) { p->cap = (p->len + size) * 2; p->buf = realloc(p->buf, p->cap); }
+    if (p->n == p->ncap) { p->ncap = p->ncap ? p->ncap * 2 : 16; p->e = realloc(p->e, sizeof *p->e * (size_t)p->ncap); }
+    memcpy(p->buf + p->len, data, size);
+    PrepEnt *e = &p->e[p->n++];
+    e->level = level; e->layer = layer; e->w = w; e->h = h; e->d = d; e->rgba8 = rgba8; e->stride = stride; e->off = p->len; e->size = size;
+    p->len += size;
+}
+static void prep_free(Prep *p) { if (p) { free(p->buf); free(p->e); free(p); } }
+static DWORD WINAPI prep_thread(void *arg) {
+    uint8_t *tmp = NULL;
+    size_t cap = 0;
+    (void)arg;
+    os_pin_host_thread();
+    for (;;) {
+        WaitForSingleObject(g_pq_ev, INFINITE);
+        for (;;) {
+            Tex *t = NULL; int decode = 0;
+            AcquireSRWLockExclusive(&g_pq_lock);
+            if (g_pq_n) { t = g_pq[g_pq_h].t; decode = g_pq[g_pq_h].decode; g_pq_h = (g_pq_h + 1) % PQ_N; g_pq_n--; }
+            ReleaseSRWLockExclusive(&g_pq_lock);
+            if (!t) break;
+            if (InterlockedCompareExchange(&t->prep_state, 2, 1) != 1) continue;      /* dropped or used meanwhile */
+            LONG64 t0 = tk();
+            Prep *p = calloc(1, sizeof *p);
+            tl_prep = p;
+            int ok = !t->dead && nvn_front_tex_read2(t, decode, prep_put, &tmp, &cap);
+            tl_prep = NULL;
+            if (ok) { InterlockedAdd64(&g_prep_bytes, (LONG64)p->len); InterlockedIncrement64(&g_prep_made); t->prep = p; }
+            else prep_free(p);
+            InterlockedAdd64(&g_prep_tk, tk() - t0);
+            MemoryBarrier();
+            InterlockedExchange(&t->prep_state, ok ? 3 : 4);
+        }
+    }
+    return 0;
+}
+static int prep_queue(Tex *t, int decode) {        /* render thread; 1: queued */
+    if (g_prep_on < 0) {
+        const char *e = getenv("SMO_VK_TEXPREP");
+        g_prep_on = e && atoi(e) > 0;      /* off by default: the textures that cost the render thread were render targets (rt_first), not these */
+        if (g_prep_on) { g_pq_ev = CreateEventA(NULL, FALSE, FALSE, NULL); CloseHandle(CreateThread(NULL, 0, prep_thread, NULL, 0, NULL)); }
+    }
+    if (!g_prep_on || t->prep_state || t->gpu_written || t->b.samples > 1 || !(t->b.packaged || (t->mem && (t->pool_flags & 1 || (t->pool_flags & 6) == 4)))) return 0;
+    if (g_prep_nready >= 4096) return 0;
+    int ok = 0;
+    AcquireSRWLockExclusive(&g_pq_lock);
+    if (g_pq_n < PQ_N) { g_pq[(g_pq_h + g_pq_n) % PQ_N].t = t; g_pq[(g_pq_h + g_pq_n) % PQ_N].decode = decode; g_pq_n++; ok = 1; }
+    ReleaseSRWLockExclusive(&g_pq_lock);
+    if (!ok) return 0;
+    t->prep_state = 1;
+    g_prep_ready[g_prep_nready++] = t;
+    SetEvent(g_pq_ev);
+    return 1;
+}
+/* the first upload of a texture: its prepared texels if there are; 0 = read them now (nvn_front_tex_read) */
+static int prep_take(Tex *t) {
+    if (!t->prep_state) return 0;
+    if (InterlockedCompareExchange(&t->prep_state, 5, 1) == 1) return 0;      /* still queued: read now, the thread skips it */
+    if (t->prep_state == 2) { LONG64 t0 = tk(); while (t->prep_state == 2) SwitchToThread(); g_prep_waited += tk() - t0; }
+    MemoryBarrier();
+    if (t->prep_state != 3 || !t->prep) { t->prep_state = 5; return 0; }
+    Prep *p = t->prep;
+    t->prep = NULL; t->prep_state = 5;
+    for (int i = 0; i < p->n; i++) { const PrepEnt *e = &p->e[i]; vt_put(t, e->level, e->layer, e->w, e->h, e->d, p->buf + e->off, e->size, e->rgba8, e->stride); }
+    prep_free(p);
+    g_prep_used++;
+    return 1;
+}
+static void prep_sweep(LONG64 frame) {             /* render thread, once a frame: preparations never used, or of textures gone */
+    int n = 0;
+    for (int i = 0; i < g_prep_nready; i++) {
+        Tex *t = g_prep_ready[i];
+        LONG s = t->prep_state;
+        if (s == 5 || s == 4) continue;
+        if (s == 3 && !((Prep *)t->prep)->frame) ((Prep *)t->prep)->frame = frame;
+        if (s == 3 && (t->dead || frame - ((Prep *)t->prep)->frame > 1200)) { prep_free(t->prep); t->prep = NULL; t->prep_state = 4; g_prep_freed++; continue; }
+        g_prep_ready[n++] = t;
+    }
+    g_prep_nready = n;
+}
 static void tex_ahead(LONG64 frame) {
     static int on = -1;
     static Tex *done_head;
@@ -1266,10 +1374,9 @@ static void tex_ahead(LONG64 frame) {
              * walk above, which ends after the oldest pending texture, went over every texture made since the start in every
              * frame: 24% of the render thread after two minutes in Cascade Kingdom). */
             VTex probe;
-            if (t->data_size > (512u << 10)) { t->ahead_seen = -1; continue; }
-            if (R.ring_pos + 2 * (uint64_t)t->data_size + (1u << 20) > R.ring_size) { pending++; oldest = t; continue; }
             tex_vkfmt(t->b.format, &probe.expand, &probe.decode);
-            if (probe.decode) { t->ahead_seen = -1; continue; }
+            if (t->data_size > (512u << 10) || probe.decode) { prep_queue(t, probe.decode); t->ahead_seen = -1; continue; }      /* to the preparation thread */
+            if (R.ring_pos + 2 * (uint64_t)t->data_size + (1u << 20) > R.ring_size) { pending++; oldest = t; continue; }
         }
         LONG64 b0 = R.upload_bytes;
         vt_get(t);
@@ -1430,6 +1537,16 @@ static VkImageView target_view(const TargetRef *r, VTex *vt) {
     if ((r->view.set & 0x84) == 0x84 && r->view.format) e.format = r->view.format;
     return vt_view(vt, &e, -1, 1);
 }
+/* A texture first used as a render target, in a memory pool the CPU cannot write (or a virtual one): what its memory holds
+ * is not a picture (the GPU's drawing never goes back there), so it is not read into the new image. The game makes such
+ * targets again and again (1600x900 and 800x450 ones in a virtual pool, about 19 at a time in New Donk City: 47 MB read
+ * in 30 ms on the render thread, 1% lows of 20 fps). SMO_VK_RT_UPLOAD=1: read as before. */
+static void rt_first2(Tex *t, unsigned pools) {
+    static int up = -1;
+    if (up < 0) up = getenv("SMO_VK_RT_UPLOAD") && atoi(getenv("SMO_VK_RT_UPLOAD"));
+    if (!up && !t->vk && !t->uploaded && !t->gpu_written && (t->pool_flags & pools)) t->gpu_written = 1;
+}
+static void rt_first(Tex *t) { rt_first2(t, 0x201); }      /* drawn into or cleared first */
 static int pass_begin(void) {
     VkRenderingAttachmentInfo ca[8], da;
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
@@ -1442,6 +1559,7 @@ static int pass_begin(void) {
         Tex *t = R.col[i].tex;
         ca[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO; ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         if (!t || t->dead) continue;
+        rt_first(t);
         VTex *vt = vt_get(t);
         if (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { nvn_vk_missing("a depth format bound as colour target"); continue; }
         if (vt->is3d && ((t->b.format == 0x3f && vt->d <= 8) || getenv("SMO_VK_3DRT_ALL"))) { static int n; if (n++ < 40) printf("nvn_vk_3drt: pass %lld: 3D texture %dx%dx%d fmt 0x%x as colour %d, view set 0x%x layers %d+%d level %d\n", (long long)nvn_front_frame_next(), vt->w, vt->h, vt->d, t->b.format, i, R.col[i].view.set, R.col[i].view.lay0, R.col[i].view.nlay, target_level(&R.col[i])); }
@@ -1452,6 +1570,7 @@ static int pass_begin(void) {
         if (!w) { w = lvl_(vt->w, target_level(&R.col[i])); h = lvl_(vt->h, target_level(&R.col[i])); if (vt->rs) { R.pass_rs = 1; R.pass_sx = vt->sx; R.pass_sy = vt->sy; } }
     }
     if (R.depth.tex && !R.depth.tex->dead) {
+        rt_first(R.depth.tex);
         VTex *vt = vt_get(R.depth.tex);
         R.depth.tex->gpu_written = 1;
         if (vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT) nvn_vk_missing("a colour format bound as depth target");
@@ -1680,6 +1799,7 @@ static void resolve_sampler(int s, VStage *v, int i) {
     g_dtex[g_ndtex].view = g_dummy.v[v->smp[i].dim]; g_dtex[g_ndtex].smp = g_smp_default; g_dtex[g_ndtex].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     g_dtex[g_ndtex].vid = 0; g_dtex[g_ndtex].bind = v->smp[i].binding;
     if (r & 1) {
+        rt_first2(t, 0x200);                       /* sampled before anything drew into it: in a virtual pool (agl's render targets) its memory holds no picture either */
         VTex *vt = vt_get(t);
         EView e;
         int attached = R.depth.tex == t, dim = v->smp[i].dim;
@@ -3290,6 +3410,7 @@ static void exec(const Cmd *m, int depth) {
         int level = (v.set & 0x81) == 0x81 ? v.lvl0 : 0, layer = (v.set & 0x82) == 0x82 ? v.lay0 : 0;
         int whole = a[6] || (r[0] == 0 && r[1] == 0 && r[2] == 0 && r[3] >= lvl_(t->b.width, level) && r[4] >= lvl_(t->b.height, level));
         pass_end();
+        if (whole) rt_first(t);
         VTex *vt = vt_get(t);
         int comps = t->b.format >= 1 && t->b.format <= 0x30 ? (t->b.format - 1) / 12 + 1 : 4;
         if (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !nvn_front_fmt(t->b.format, &f) || f.kind == 4 || vt->decode || vt->expand) { nvn_vk_missing("nvnCommandBufferClearTexture of a depth, compressed or 3-component texture"); break; }
@@ -4016,6 +4137,7 @@ shown:
         if (holdlog_on() && g_up_fr_tk * 1000 > 3 * fq.QuadPart) { static int nl; if (nl++ < 300) printf("nvn_vk_upl: frame %lld (%s): %d textures made or read at their use, %.1f MB, %.1f ms\n", (long long)frame, g_in_scene ? "scene" : "no scene", g_up_fr_n, (double)g_up_fr_bytes / 1048576.0, (double)g_up_fr_tk * 1000.0 / (double)fq.QuadPart); }
         g_up_fr_tk = g_up_fr_bytes = 0; g_up_fr_n = 0;
         tex_ahead(frame);
+        prep_sweep(frame);
     }
     tex_reclaim(frame);
     if (frame % 300 == 0) {                      /* where the render thread's time went, per frame, in the last 300 frames */
@@ -4033,6 +4155,12 @@ shown:
             double mb[5];
             for (int i = 0; i < 5; i++) { mb[i] = (double)(g_rp_kind_bytes[i] - kl[i]) / 300.0 / 1048576.0; kl[i] = g_rp_kind_bytes[i]; }
             printf("nvn_vk_ring_kinds: frames %lld..%lld MB copied a frame: uniform %.2f, storage %.2f, vertex %.2f, index %.2f, other %.2f\n", (long long)frame - 300, (long long)frame, mb[0], mb[1], mb[2], mb[3], mb[4]);
+            if (g_prep_on > 0) {
+                LARGE_INTEGER pq; QueryPerformanceFrequency(&pq);
+                printf("nvn_vk_texprep: frames %lld..%lld: textures prepared on their thread %lld (%lld MB, %.1f ms each), used %lld, freed unused %lld, waited for %.1f ms in all, %d pending\n",
+                       (long long)frame - 300, (long long)frame, (long long)g_prep_made, (long long)(g_prep_bytes >> 20), g_prep_made ? (double)g_prep_tk * 1000.0 / (double)pq.QuadPart / (double)g_prep_made : 0.0,
+                       (long long)g_prep_used, (long long)g_prep_freed, (double)g_prep_waited * 1000.0 / (double)pq.QuadPart, g_prep_nready);
+            }
             if (g_hm_on > 0) {
                 static LONG64 lb, lr, lw, lwt, lsu;
                 LARGE_INTEGER hq; QueryPerformanceFrequency(&hq);
