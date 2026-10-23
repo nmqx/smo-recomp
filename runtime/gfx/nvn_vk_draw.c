@@ -1042,7 +1042,15 @@ static void tex_ahead(LONG64 frame) {
     Tex *head = nvn_front_tex_first();
     if (head == done_head) return;
     int fr = scene_recent();
-    LONG64 t0 = tk(), budget = fq * (fr ? 1 : 4) / 1000;
+    /* a loading screen (this frame: no compute dispatch, at most 60 draws) right after a scene is "near a scene" too, but the
+     * render thread has nothing else to do then: the large and decoded textures of the next stage were left for their first
+     * draw, and the first frame of New Donk City made 198 of them (126 MB, 82 ms) and the next three 109 more. During a
+     * loading screen the near-scene rules are lifted and the budget is 8 ms. SMO_VK_TEXAHEAD_LOAD=0: as before. */
+    static int load_on = -1;
+    if (load_on < 0) { const char *e = getenv("SMO_VK_TEXAHEAD_LOAD"); load_on = !(e && !atoi(e)); }
+    int loading = load_on && !g_in_scene && R.frame_draws <= 60;
+    if (loading) fr = 0;
+    LONG64 t0 = tk(), budget = fq * (loading ? 8 : fr ? 1 : 4) / 1000;
     int pending = 0, taken = 0;
     Tex *oldest = NULL;                            /* the oldest texture still pending: the next walk ends after it */
     g_ta_inside = 1;
@@ -1052,7 +1060,7 @@ static void tex_ahead(LONG64 frame) {
         if (t->vk || t->dead || t->image_freed) { t->ahead_seen = -1; continue; }
         if (!t->ahead_seen) { t->ahead_seen = frame + 1; pending++; oldest = t; continue; }
         if (frame + 1 - t->ahead_seen < 2) { pending++; oldest = t; continue; }
-        if (t->gpu_written || (!t->mem && !t->b.packaged) || t->b.samples > 1 || t->b.width <= 0 || t->b.height <= 0 || !nvn_front_fmt(t->b.format, &f) || f.kind != 4) { t->ahead_seen = -1; continue; }
+        if (t->gpu_written || (!t->mem && !t->b.packaged) || t->b.samples > 1 || t->b.width <= 0 || t->b.height <= 0 || !nvn_front_fmt(t->b.format, &f) || (f.kind != 4 && !loading)) { t->ahead_seen = -1; continue; }      /* uncompressed ones only during a loading screen: what the first draw would read, earlier */
         if (taken && tk() - t0 > budget) { pending++; oldest = t; continue; }
         if (fr) {
             /* near a scene (a frame of the last 600 had compute dispatches) only what is certainly cheap: at most 512 KB, no

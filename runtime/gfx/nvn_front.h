@@ -55,7 +55,7 @@ typedef struct Tex {
 } Tex;
 Tex *nvn_front_tex_first(void);            /* the newest texture record; ->all_next = the one made before it (records are never freed) */
 typedef struct { Tex *tex; View view; int held; } TexPoolEnt;      /* held: the entry counts in tex->nslots (agl has not released the slot) */
-typedef struct { int count; TexPoolEnt *e; uint64_t mempool, offset; } TexPool;
+typedef struct { int count; TexPoolEnt *e; uint64_t mempool, offset; uint8_t *ever; /* ever: the entry was registered once (nvn_gl.c tpool_register) */ } TexPool;
 typedef struct { int count; SamplerParams *e; uint8_t *used; uint64_t mempool, offset; } SamplerPool;
 typedef struct { char *text; int len, state, nbuf; GLuint gl; uint8_t map[16]; uint32_t storage, storage_w, glsl_ssbo_w, local[3], smem_bytes, lmem_bytes, glsl_images, glsl_images_w, glsl_images_r; uint16_t glsl_img_key[8], glsl_img_fmt[8]; const uint8_t *code; int code_len, dumped, glsl_state, glsl_alpha; GLuint glsl; uint32_t glsl_cbufs, glsl_ssbos, glsl_dep, glsl_tex, glsl_key[4], ctl[8]; void *vk; } Stage;   /* state: 0 none, 1 text ready, 2 compiled, 3 rejected, 4 machine code only; vk: the Vulkan back end's last variant of this stage */
 typedef struct { Stage st[6]; int serial, sample_shading, label_dirty; volatile LONG dead; uint64_t guest; } Prog;

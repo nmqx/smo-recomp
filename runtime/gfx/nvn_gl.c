@@ -4284,10 +4284,17 @@ static void spool_initialize(Ctx *c) {                 /* (pool, memoryPool, off
     sp->used = calloc((size_t)sp->count + 1, 1);
     RET(1);
 }
+/* A pool entry never registered before cannot be named by a command still queued for the render thread, so its first
+ * registration need not wait for the queue (gl_barrier), with SMO_POOL_BARRIER=0: entering New Donk City the game's resource loader registers
+ * hundreds of new samplers and textures while holding a mutex the main thread needs, and each wait for the replay of
+ * the frames queued (textures being made at their first use) held the main thread 37-61 ms. Registering over an entry
+ * that was used still waits. Measured on entering the city: no difference in hitches (13-15 either way), so every
+ * registration still waits by default. */
+static int pool_barrier_all(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_POOL_BARRIER"); on = !(e && !atoi(e)); } return on; }      /* default: every registration waits (no gain measured without it); SMO_POOL_BARRIER=0 tries the first-registration rule */
 static void spool_register(Ctx *c) {                   /* (pool, id, sampler) or (pool, id, samplerBuilder): same contents */
-    gl_barrier();
     SamplerPool *sp = hobj(A0, K_SPOOL);
-    if (!sp || (uint32_t)A1 >= (uint32_t)sp->count || !A2) return;
+    if (!sp || (uint32_t)A1 >= (uint32_t)sp->count || !A2) { gl_barrier(); return; }
+    if (sp->used[(uint32_t)A1] || pool_barrier_all()) gl_barrier();
     AcquireSRWLockExclusive(&g_pool_lock);
     memcpy(&sp->e[(uint32_t)A1], P(A2), sizeof(SamplerParams));
     sp->used[(uint32_t)A1] = 1;
@@ -4474,16 +4481,18 @@ static void tpool_initialize(Ctx *c) {                 /* (pool, memoryPool, off
     TexPool *tp = hnew(A0, K_TPOOL, sizeof *tp);
     tp->count = (int)A3 > 0 ? (int)A3 : 0; tp->mempool = A1; tp->offset = A2;
     tp->e = calloc((size_t)tp->count + 1, sizeof *tp->e);
+    tp->ever = calloc((size_t)tp->count + 1, 1);
     AcquireSRWLockExclusive(&g_pool_lock);
     if (g_ntpools < 16) g_tpools[g_ntpools++] = tp;     /* where an agl release (tex_finalize) looks for its slot; SMO makes 1 */
     ReleaseSRWLockExclusive(&g_pool_lock);
     RET(1);
 }
 static void tpool_register(Ctx *c) {                   /* (pool, id, texture, view) */
-    gl_barrier();
     TexPool *tp = hobj(A0, K_TPOOL);
     TexPoolEnt e;
-    if (!tp || (uint32_t)A1 >= (uint32_t)tp->count) return;
+    if (!tp || (uint32_t)A1 >= (uint32_t)tp->count) { gl_barrier(); return; }
+    if (!tp->ever || tp->ever[(uint32_t)A1] || pool_barrier_all()) gl_barrier();      /* an entry registered before: see spool_register */
+    if (tp->ever) tp->ever[(uint32_t)A1] = 1;
     memset(&e, 0, sizeof e);
     e.tex = hobj(A2, K_TEX);
     if (A3) memcpy(&e.view, P(A3), sizeof e.view);
