@@ -3390,6 +3390,16 @@ static void pass_shot(void) {
         }
         free(hp); n++; return;
     }
+    if (t->b.format == 0x2e && vt->bpb == 16 && vt->w * vt->h <= 64) {      /* RGBA32F, small (the 1x1 exposure of the tone mapping): its values */
+        int w1 = vt->w, h1 = vt->h, r1[6] = {0, 0, 0, w1, h1, 1};
+        float fv[64 * 4];
+        if (read_region(t, NULL, r1, fv, 0, 0)) {
+            printf("nvn_vk_pass: pass %d: %dx%d RGBA32F:", n, w1, h1);
+            for (int k = 0; k < w1 * h1 && k < 4; k++) printf(" (%g %g %g %g)", fv[k * 4], fv[k * 4 + 1], fv[k * 4 + 2], fv[k * 4 + 3]);
+            printf("\n");
+        }
+        n++; return;
+    }
     if ((vt->bpb != 4 && !half4) || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { printf("nvn_vk_pass: pass %d: colour format 0x%x not captured\n", n++, (unsigned)t->b.format); return; }
     busy = 1;
     int w = vt->rs ? t->b.width : vt->w, h = vt->rs ? t->b.height : vt->h, rr[6] = {0, 0, 0, w, h, 1};
@@ -3415,11 +3425,19 @@ static void pass_shot(void) {
         got = read_region(t, NULL, rr, px, 0, 0) != 0;
         if (got && t->b.format == 0x3f) {          /* B10G11R11 float: an exponent of all ones is infinite or NaN */
             long long bad = 0;
+            double mx[3] = {0, 0, 0}, sm[3] = {0, 0, 0};
             for (size_t k = 0; k < (size_t)w * h; k++) {
                 uint32_t q; memcpy(&q, px + k * 4, 4);
-                if (((q >> 6) & 31) == 31 || ((q >> 17) & 31) == 31 || ((q >> 27) & 31) == 31) bad++;
+                if (((q >> 6) & 31) == 31 || ((q >> 17) & 31) == 31 || ((q >> 27) & 31) == 31) { bad++; continue; }
+                for (int c = 0; c < 3; c++) {      /* R: bits 0-10, G: 11-21 (6-bit mantissas), B: 22-31 (5-bit) */
+                    int sh = c == 0 ? 0 : c == 1 ? 11 : 22, mb = c == 2 ? 5 : 6;
+                    uint32_t man = (q >> sh) & ((1u << mb) - 1), ex = (q >> (sh + mb)) & 31;
+                    double f = ex ? ldexp(1.0 + (double)man / (double)(1u << mb), (int)ex - 15) : ldexp((double)man / (double)(1u << mb), -14);
+                    sm[c] += f; if (f > mx[c]) mx[c] = f;
+                }
             }
-            printf("nvn_vk_pass: pass %d: %dx%d R11G11B10F: %lld pixels infinite or NaN\n", n, w, h, bad);
+            printf("nvn_vk_pass: pass %d: %dx%d R11G11B10F: %lld pixels infinite or NaN; mean %g %g %g, max %g %g %g\n", n, w, h, bad,
+                   sm[0] / ((double)w * h), sm[1] / ((double)w * h), sm[2] / ((double)w * h), mx[0], mx[1], mx[2]);
         }
     }
     if (got) {
