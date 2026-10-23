@@ -64,7 +64,7 @@ something was not checked, it says so.
 
 - Windows 10/11 x64 and a Vulkan 1.3 GPU (developed on NVIDIA; `VK_EXT_graphics_pipeline_library`,
   `VK_EXT_extended_dynamic_state3`, `VK_EXT_vertex_input_dynamic_state` and `VK_EXT_depth_clip_control` are used).
-- Your own *Super Mario Odyssey* dump: the 1.4.1 program, the base game's executable, the RomFS with the update applied
+- Your own *Super Mario Odyssey* dump at version 1.4.1 or 1.3.0: the program with the update, the RomFS with the update applied
   and the update's control data. [`docs/building.md`](docs/building.md) lists what to dump and how to lay it out.
 - [LLVM/clang 9.0.0](https://releases.llvm.org/), Visual Studio 2019 Build Tools (16.11) with Windows SDK 10.0.19041,
   the [Vulkan SDK](https://vulkan.lunarg.com/) 1.4, [SDL3](https://github.com/libsdl-org/SDL) 3.4.18, the
@@ -92,7 +92,7 @@ about 3 minutes on 12 threads, link 1 minute).
    ```
    <dump>\
      exefs\          the program's ExeFS with the update (1.4.1 or 1.3.0): main, main.npdm, sdk, rtld, subsdk0
-     exefs-1.0.0\    the base game's ExeFS (or only its main): its symbols name the update's functions
+     exefs-1.0.0\    not needed any more (an older layout's base game ExeFS): ignored if present
      romfs\          the RomFS with the update applied (about 5.7 GB)
      control.nacp    the update's control data (its display version is checked: 1.4.1 or 1.3.0)
      manual\         optional: the Help pages (html-document\...)
@@ -135,7 +135,9 @@ about 3 minutes on 12 threads, link 1 minute).
 ## What this fork changes
 
 - **1.3.0 accepted** (`tools/target.py` `VERSIONS`): the import, the generated tables and the setup report the dump's own
-  version.
+  version. 1.3.0's `main` is NintendoSDK 7.3.2 like 1.4.1's, and every rule of `tools/lifter/gen_tables.py` that finds
+  the game functions the runtime needs gives exactly one function in it (the same addresses the base executable's
+  symbols gave before), so the base game's ExeFS is not needed for 1.3.0 either.
 - **Frame interpolation** (`runtime/gfx/nvn_vk_interp.c`, `frame_interpolation = optical_flow` in `graphics.ini`;
   `SMO_VK_INTERP=1/0` wins). Each frame of the game is copied out; the GPU's optical flow engine (`VK_NV_optical_flow`,
   on its own queue) measures the motion to the frame before in both directions on a 4x4 grid; a compute stage makes the
