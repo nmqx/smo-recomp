@@ -91,7 +91,16 @@ static const char *const k_default_ini =
 ";   (VK_NV_optical_flow) finds between them, and shown halfway: 120 frames a second. The game itself still runs at 60;\r\n"
 ";   the made frames are not the game's (edges of moving things can smear) and each frame of the game is shown about\r\n"
 ";   8 ms later. Without the extension it stays off (said in the log).\r\n"
-"frame_interpolation = off\r\n";
+"frame_interpolation = off\r\n"
+"\r\n"
+"; frame_interpolation_multiplier = 2 | 3 | 4 | 5 | 6 | display      (with frame_interpolation = optical_flow)\r\n"
+";   2: one frame made between two of the game's, 120 frames a second. N: N - 1 frames made between them, a game\r\n"
+";   frame / N apart: 60 N a second (3: 180, 4: 240); each frame of the game is shown (N - 1) / N of a frame later.\r\n"
+";   Worth it only up to the display's refresh rate: above it the pictures the display has no time for are dropped.\r\n"
+";   display: one picture per refresh of the display (a 144 or 165 Hz monitor too, not a multiple of 60), each made\r\n"
+";   at the place in time between the game's two frames where that refresh falls; about a frame later than the game.\r\n"
+";   SMO_VK_INTERP_MULT=<n> | display wins.\r\n"
+"frame_interpolation_multiplier = 2\r\n";
 
 #define GFX_LOW_SCALE 0.5f
 #define GFX_LOW_SCALE_TEXT "0.50"
@@ -127,7 +136,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
-    o->width = 1280; o->height = 720; o->scale = 1.0f; o->window_mode = 3;
+    o->width = 1280; o->height = 720; o->scale = 1.0f; o->window_mode = 3; o->interp_mult = 2;
     opt_path(o->path);
     FILE *f = fopen(o->path, "rb");
     if (!f) {
@@ -158,6 +167,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "shader_wait")) o->shader_skip = !_stricmp(val, "skip");
         else if (!_stricmp(key, "unfocused")) o->pause_unfocused = !_stricmp(val, "pause");
         else if (!_stricmp(key, "frame_interpolation")) o->interp = !_stricmp(val, "optical_flow") || !_stricmp(val, "on");
+        else if (!_stricmp(key, "frame_interpolation_multiplier")) { int v = atoi(val); o->interp_mult = !_stricmp(val, "display") ? 0 : v >= 2 && v <= 6 ? v : 2; }
         else unknown++;
     }
     if (f) fclose(f);
@@ -166,11 +176,12 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     }
     printf("graphics profile: %s\n", o->profile == 1 ? "low (weak or integrated GPU): resolution_scale=" GFX_LOW_SCALE_TEXT ", anisotropic_filtering=game, vsync=clock; these three keys of the file are not used"
                                                      : "custom (every key of graphics.ini as written; 'profile = low' is the set for a weak or integrated GPU)");
-    static const char *const k_win[4] = {"windowed", "borderless_fullscreen", "fullscreen", "borderless_window"}, *const k_vs[4] = {"clock", "on", "off", "mailbox"};
-    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d unfocused=%s vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s frame_interpolation=%s%s\n", o->path,
+    static const char *const k_win[4] = {"windowed", "borderless_fullscreen", "fullscreen", "borderless_window"}, *const k_vs[4] = {"clock", "on", "off", "mailbox"},
+                             *const k_mult[7] = {"display", "?", "2", "3", "4", "5", "6"};
+    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d unfocused=%s vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s frame_interpolation=%s frame_interpolation_multiplier=%s%s\n", o->path,
            written ? "written with the defaults" : f ? "read" : "NOT readable, defaults used", o->renderer ? "opengl" : "vulkan", k_win[o->window_mode], o->width, o->height,
            o->pause_unfocused ? "pause" : "run", k_vs[o->present], o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off",
-           o->interp ? "optical_flow" : "off", unknown ? " (lines with an unknown key were ignored)" : "");
+           o->interp ? "optical_flow" : "off", k_mult[o->interp_mult], unknown ? " (lines with an unknown key were ignored)" : "");
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
     if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 3.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 3.0: the nearest of the two is used\n", o->scale);
     fflush(stdout);
