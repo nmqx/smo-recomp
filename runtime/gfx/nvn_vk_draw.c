@@ -1683,6 +1683,18 @@ static void resolve_sampler(int s, VStage *v, int i) {
         int attached = R.depth.tex == t, dim = v->smp[i].dim;
         for (int k = 0; k < R.ncol; k++) attached |= R.col[k].tex == t;
         eview_of(t, vt, &view, &e);
+        /* a texture sampled while one of its levels is the colour target (the bloom's downsample chain: level n - 1 read,
+         * level n drawn into): the sampled view stops below the level drawn. With every level in the view, a sampler with
+         * mipmaps read the level being drawn, as the last frame left it, and that loop could grow to the format's largest
+         * value: a white screen in New Donk City until the stage changed. SMO_VK_FEEDBACK_LEVELS=0: every level. */
+        if (attached) {
+            static int clip = -1;
+            if (clip < 0) clip = !(getenv("SMO_VK_FEEDBACK_LEVELS") && !atoi(getenv("SMO_VK_FEEDBACK_LEVELS")));
+            for (int k = 0; clip && k < R.ncol; k++) {
+                int l = R.col[k].tex == t ? target_level(&R.col[k]) : -1;
+                if (l > e.lvl0 && e.lvl0 + e.nlvl > l) e.nlvl = l - e.lvl0;
+            }
+        }
         int have = target_dim(e.target);
         int ok = have == dim || (dim == DIM_2D && (have == DIM_2DA || have == DIM_CUBE || have == DIM_CUBEA)) || (dim == DIM_2DA && (have == DIM_2D || have == DIM_CUBE || have == DIM_CUBEA)) ||
                  (dim == DIM_CUBE && have == DIM_CUBEA) || (dim == DIM_CUBEA && have == DIM_CUBE) || (dim == DIM_1D && have == DIM_1DA) || (dim == DIM_1DA && have == DIM_1D) ||

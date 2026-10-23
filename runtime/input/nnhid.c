@@ -1038,6 +1038,19 @@ static void hid_InitializeTouchScreen(Ctx *c) { (void)c; g_touch_ready = 1; }
  * StartSixAxisSensor sets the per-controller "sensor enabled" flag; an invalid handle is an error.
  * Hardware limit: XInput delivers no motion, so the record stays the one at rest. */
 static struct { int ever, connected, started; ULONGLONG since; int64_t base, last; } g_six[8];
+/* [hotkeys] shake_pad: a press is a flick of the controller, a burst of 120 ms (4 G one way then the other every 20 ms, with
+ * a turn), the way a real shake reads; held, a new burst every 250 ms. (A steady swing while held did not give the cap throw's
+ * shake after a spin.) shake_active: a burst is under way for this player. */
+static struct { int down; ULONGLONG start; } g_shake[8];
+static int shake_active(uint32_t id, int held, int *ph) {
+    ULONGLONG now = GetTickCount64();
+    if (id >= 8) return 0;
+    if (!held) { g_shake[id].down = 0; return 0; }
+    if (!g_shake[id].down || now - g_shake[id].start >= 250) { g_shake[id].down = 1; g_shake[id].start = now; }
+    ULONGLONG t = now - g_shake[id].start;
+    *ph = (int)((t / 20) & 1);
+    return t < 120;
+}
 static void hid_GetSixAxisSensorState(Ctx *c) {             /* (SixAxisSensorState *out, const SixAxisSensorHandle &) */
     uint64_t o = A0;
     uint32_t handle = rd32(A1), kind = handle & 0xff, id = (handle >> 8) & 0xff;
@@ -1056,9 +1069,9 @@ static void hid_GetSixAxisSensorState(Ctx *c) {             /* (SixAxisSensorSta
     wr64(o + 8, (uint64_t)g_six[id].last);                   /* sampling number */
     {   NnPadState ps;                                       /* a pad with a gyro (SDL): its acceleration (G) at +0x10 and angular velocity (revolutions/s) at +0x1c; angle and direction stay at rest */
         int got = sdl_on() && nnpad_get((int)id, &ps);
-        if (got && ps.shake) {                               /* [hotkeys] shake_pad held: the pad swung back and forth, 2.5 G one way then the other every 33 ms */
-            int ph = (int)((GetTickCount64() / 33) & 1);
-            float a[3] = {ph ? 2.5f : -2.5f, ph ? 1.5f : -1.5f, -1.0f}, g[3] = {ph ? 2.0f : -2.0f, 0.0f, ph ? 1.0f : -1.0f};
+        int ph = 0;
+        if (got && shake_active(id, ps.shake, &ph)) {        /* [hotkeys] shake_pad: a burst (shake_active) */
+            float a[3] = {ph ? 4.0f : -4.0f, ph ? 2.0f : -2.0f, -1.0f}, g[3] = {ph ? 3.0f : -3.0f, 0.0f, ph ? 1.5f : -1.5f};
             memcpy((void *)(uintptr_t)(o + 0x10), a, 12); memcpy((void *)(uintptr_t)(o + 0x1c), g, 12);
         } else if (got && ps.has_motion) {
             memcpy((void *)(uintptr_t)(o + 0x10), ps.accel, 12); memcpy((void *)(uintptr_t)(o + 0x1c), ps.gyro, 12);
@@ -1110,7 +1123,8 @@ static void hid_IsSixAxisSensorAtRest(Ctx *c) {
     if (!(id < 8 || id == 0x10 || id == 0x20) || dev > 2)
         guest_trap("nn::hid::IsSixAxisSensorAtRest with an invalid handle (the hid module refuses it and the SDK aborts, sdk 0x250b9c)", c->x[30] - 4);
     {   NnPadState ps;                                       /* a pad with a gyro: at rest while it turns slower than ~7 degrees/s (NOT VERIFIED: the module's threshold) */
-        if (sdl_on() && id < 8 && nnpad_get((int)id, &ps) && ps.shake) { RET(0); return; }
+        int ph;
+        if (sdl_on() && id < 8 && nnpad_get((int)id, &ps) && ps.shake && shake_active(id, 1, &ph)) { RET(0); return; }
         if (sdl_on() && id < 8 && nnpad_get((int)id, &ps) && ps.has_motion) { RET(fabsf(ps.gyro[0]) + fabsf(ps.gyro[1]) + fabsf(ps.gyro[2]) < 0.02f); return; }
     }
     RET(1);
