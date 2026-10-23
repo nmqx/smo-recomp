@@ -110,7 +110,17 @@ static void sampler_register(Ctx *c) {
     uint64_t at = slots + (uint64_t)((int64_t)(int32_t)index * 0x68);
     uint64_t slot = count > index ? at : slots;
     uint32_t refs = rd16(slot + 0x60);
-    if (!refs) { g_reg_free++; g_lifted_register(c); return; }
+    if (!refs) {
+        g_reg_free++;
+        if ((g_reg_free & 255) == 0) {      /* how full the game's sampler table is (sampler ids past 4095 do not fit a texture handle) */
+            static uint32_t peak;
+            uint32_t taken = 0;
+            for (uint32_t k = 0; k < count; k++) taken += rd16(slots + (uint64_t)k * 0x68 + 0x60) != 0;
+            if (taken > peak + 64 || (g_reg_free & 8191) == 0) { if (taken > peak) peak = taken; printf("smo_fast: sampler table: %u of %u slots taken (peak %u), cursor index %u, %lld registrations\n", taken, count, peak, index, g_reg_free); }
+        }
+        g_lifted_register(c);
+        return;
+    }
     g_reg_taken++;
     c->x[8] = refs; c->x[9] = slots; c->x[10] = at;
     c->x[0] = 0xffffffffu;                       /* mov w21, #-1 ... mov w0, w21: the upper half is zero */

@@ -4293,7 +4293,11 @@ static void spool_initialize(Ctx *c) {                 /* (pool, memoryPool, off
 static int pool_barrier_all(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_POOL_BARRIER"); on = !(e && !atoi(e)); } return on; }      /* default: every registration waits (no gain measured without it); SMO_POOL_BARRIER=0 tries the first-registration rule */
 static void spool_register(Ctx *c) {                   /* (pool, id, sampler) or (pool, id, samplerBuilder): same contents */
     SamplerPool *sp = hobj(A0, K_SPOOL);
-    if (!sp || (uint32_t)A1 >= (uint32_t)sp->count || !A2) { gl_barrier(); return; }
+    if (!sp || (uint32_t)A1 >= (uint32_t)sp->count || !A2) {
+        static int n;
+        if (sp && A2 && n++ < 10) printf("nvn: RegisterSampler id %u outside the sampler pool (%d entries): not registered; a texture handle naming it reads sampler %u\n", (unsigned)A1, sp->count, (unsigned)A1 & 0xfff);
+        gl_barrier(); return;
+    }
     if (sp->used[(uint32_t)A1] || pool_barrier_all()) gl_barrier();
     AcquireSRWLockExclusive(&g_pool_lock);
     memcpy(&sp->e[(uint32_t)A1], P(A2), sizeof(SamplerParams));

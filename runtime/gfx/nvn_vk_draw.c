@@ -1702,6 +1702,20 @@ static void resolve_sampler(int s, VStage *v, int i) {
             if (n < 3) printf("nvn_vk: (detail of the next line) frame %lld, program #%d, texture format 0x%x, %d x %d x %d, %d levels, draws so far with a dummy for a view-kind mismatch: %lld\n", (long long)nvn_front_frame_next(), R.prog[s] ? R.prog[s]->serial : -1, t->b.format, t->b.width, t->b.height, t->b.depth, nvn_front_tex_levels(t), (long long)R.dummy_kind);
             if (n++ < 20) printf("nvn_vk: texture unit %u of the %s stage: the shader declares view kind %d, the texture is kind %d (target %d, %d samples): a dummy is bound\n", u, s ? "fragment" : "vertex", dim, have, e.target, vt->samples); }
         if (r & 2) g_dtex[g_ndtex].smp = sampler_get(&sp);
+        else {
+            /* a live texture whose handle names a sampler the pool does not hold (sampler ID 0, one of NVN's reserved
+             * descriptors, in New Donk City's bloom after a while). On the console the GPU reads that slot of the
+             * pool's memory, zero: no mipmaps, level 0 only. The default sampler (every level) made the bloom's
+             * downsample from level 0 to level 1 of one texture read level 1 itself, as its last frame left it, and that
+             * loop grew to the format's largest value: a white screen until the stage changed. SMO_VK_SMP_ZERO=0: the
+             * default sampler as before. */
+            static int zero = -1; static LONG64 n;
+            if (zero < 0) zero = !(getenv("SMO_VK_SMP_ZERO") && !atoi(getenv("SMO_VK_SMP_ZERO")));
+            if (zero) { static const SamplerParams z; g_dtex[g_ndtex].smp = sampler_get(&z); }
+            if (n++ < 5 || n % 10000 == 0) printf("nvn_vk: frame %lld, program #%d: a texture handle (unit %u of the %s stage) names sampler %llu, not in the sampler pool: %s (%lld so far)\n",
+                                       (long long)nvn_front_frame_next(), R.prog[s] ? R.prog[s]->serial : -1, u, s ? "fragment" : "vertex", (unsigned long long)((handle >> 20) & 0xfff),
+                                       zero ? "a zero sampler (level 0, nearest)" : "the default sampler", (long long)n);
+        }
     }
     g_ndtex++;
 }
@@ -2363,11 +2377,37 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
         d->wm_off = wm_off; d->written = v->ssbo_w; memcpy(d->cb, wcb, sizeof wcb);
     }
 }
+/* debug aid, with a pass capture (F12 / SMO_VK_PASSSHOT): the GLSL of the vertex and fragment stages of each program drawn
+ * in that frame, translated again, as prog_<serial>_<stage>.glsl in SMO_SHOT_DIR (once per program and run) */
+static void passshot_glsl(const Prog *p) {
+    static int seen[4096], nseen;
+    const char *dir = getenv("SMO_SHOT_DIR");
+    if (!p || !dir) return;
+    for (int i = 0; i < nseen; i++) if (seen[i] == p->serial) return;
+    if (nseen < 4096) seen[nseen++] = p->serial;
+    for (int s = 0; s < 2; s++) {
+        const Stage *st = &p->st[s];
+        if (!st->code) continue;
+        MxIn in;
+        MxOut out;
+        memset(&in, 0, sizeof in); memset(&out, 0, sizeof out);
+        in.stage = s; in.code = st->code; in.code_len = st->code_len;
+        in.int_tex = R.tex_int[s]; in.sint_tex = R.tex_sint[s];
+        in.target = 1; in.binding_base = 40u * (unsigned)s; in.ssbo_base = 40u * (unsigned)s + 20; in.tex_base = 40u * (unsigned)s; in.image_base = 40u * (unsigned)s + 32; in.wmask_binding = 40u * (unsigned)s + 38;
+        char path[300];
+        snprintf(path, sizeof path, "%s/prog_%05d_%d.glsl", dir, p->serial, s);
+        FILE *f = fopen(path, "wb");
+        if (!f) continue;
+        if (mx_translate(&in, &out)) fputs(out.glsl, f); else fprintf(f, "// not translated: %s\n", out.why);
+        fclose(f);
+    }
+}
 /* Everything of a draw up to the draw call. topo: NVN primitive. Returns 0 when the draw cannot be done (counted as skipped). */
 static int draw_prepare(unsigned prim) {
     {   /* with SMO_VK_PASSSHOT: the state of each draw of that frame (every draw kind passes here) */
             static int want = -2;
             want = passshot_frame() ? 1 : -1;
+            if (want >= 0) { passshot_glsl(R.prog[0]); if (R.prog[1] != R.prog[0]) passshot_glsl(R.prog[1]); }
             if (want >= 0)
                 printf("nvn_vk_draw: prim %u programs vs #%d fs #%d gs #%d target %p | viewport %s %.0f %.0f %.0f %.0f | scissor %s %d %d %d %d | pass %dx%d in_pass %d | cull %u discard %d render_off %d | chanmask %08x blend_on %x blend0 %u %u %u %u %u %u | ds %llx\n",
                        prim, R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1, R.prog[2] ? R.prog[2]->serial : -1, (void *)R.col[0].tex, R.have_viewport ? "set" : "default", R.viewport[0], R.viewport[1], R.viewport[2], R.viewport[3],
