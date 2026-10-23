@@ -28,6 +28,9 @@ PICTURES = [('720p (1280x720) - le plus léger', 0.8), ('900p (1600x900) - celle
 WINDOWS = [('Plein écran sans bordure', 'borderless_fullscreen', None), ('Fenêtre 1280x720', 'borderless_window', (1280, 720)),
            ('Fenêtre 1600x900', 'borderless_window', (1600, 900)), ('Fenêtre 1920x1080', 'borderless_window', (1920, 1080)),
            ('Fenêtre 2560x1440', 'borderless_window', (2560, 1440))]
+# (label, frame_interpolation, frame_interpolation_multiplier); écran = one picture per refresh of the monitor
+INTERPS = [('Non', 'off', None), ('x2 (120 fps)', 'optical_flow', '2'), ('x3 (180 fps)', 'optical_flow', '3'),
+           ('x4 (240 fps)', 'optical_flow', '4'), ("Écran (une image par rafraîchissement)", 'optical_flow', 'display')]
 
 
 def read_ini():
@@ -91,8 +94,13 @@ def main():
     win = tk.StringVar(value=win_now)
     row(1, 'Affichage', ttk.Combobox(f, textvariable=win, values=win_labels, state='readonly', width=34))
 
-    interp = tk.BooleanVar(value=keys.get('frame_interpolation', 'off') in ('optical_flow', 'on'))
-    row(2, 'Interpolation 120 fps (NVIDIA)', ttk.Checkbutton(f, variable=interp))
+    if keys.get('frame_interpolation', 'off') in ('optical_flow', 'on'):
+        mult = keys.get('frame_interpolation_multiplier', '2') or '2'
+        interp_now = next((x[0] for x in INTERPS if x[2] == mult), INTERPS[1][0])
+    else:
+        interp_now = INTERPS[0][0]
+    interp = tk.StringVar(value=interp_now)
+    row(2, 'Interpolation (NVIDIA)', ttk.Combobox(f, textvariable=interp, values=[x[0] for x in INTERPS], state='readonly', width=34))
     fps = tk.BooleanVar(value=keys.get('frame_time_overlay', 'off') in ('on', '1'))
     row(3, 'Compteur FPS', ttk.Checkbutton(f, variable=fps))
     aniso = tk.BooleanVar(value=keys.get('anisotropic_filtering', 'game') == '16')
@@ -115,11 +123,14 @@ def main():
     def save():
         w = dict((x[0], x) for x in WINDOWS)[win.get()]
         values = {'resolution_scale': ('%.3f' % scale_of(pic.get())).rstrip('0').rstrip('.'), 'window': w[1],
-                  'frame_interpolation': 'optical_flow' if interp.get() else 'off',
+                  'frame_interpolation': dict((x[0], x[1]) for x in INTERPS)[interp.get()],
                   'frame_time_overlay': 'on' if fps.get() else 'off',
                   'anisotropic_filtering': '16' if aniso.get() else 'game'}
         if w[2]:
             values['width'], values['height'] = str(w[2][0]), str(w[2][1])
+        mult = dict((x[0], x[2]) for x in INTERPS)[interp.get()]
+        if mult:                                   # 'Non' keeps the multiplier the file has
+            values['frame_interpolation_multiplier'] = mult
         write_ini(values)
 
     def play():

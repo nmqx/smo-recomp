@@ -17,6 +17,7 @@ typedef struct {
     int profile;            /* 0 custom (the keys as written), 1 low: scale, aniso and present are set by the profile (gfx_options.c) */
     int pause_unfocused;     /* unfocused: 0 run (the game goes on while the window is not active), 1 pause (nnmisc.c oe_watch stops it) */
     int interp;              /* frame_interpolation: 0 off, 1 optical_flow (nvn_vk_interp.c: a frame made between two of the game's, 120 a second; env SMO_VK_INTERP wins) */
+    int interp_mult;         /* frame_interpolation_multiplier: 2..6 pictures per game frame (60 N a second), 0 = display (one per refresh of the display); env SMO_VK_INTERP_MULT wins */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */
 #endif
