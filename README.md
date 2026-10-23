@@ -71,9 +71,7 @@ py -3.13 -m venv .venv
 
 ## Play
 
-```bat
-.venv\Scripts\pythonw scripts\launcher.py
-```
+Double-click **`play.bat`** (or run `.venv\Scripts\pythonw scripts\launcher.py`).
 
 The launcher sets the picture and window options, then starts the game:
 
@@ -142,6 +140,26 @@ Still to do: shorter stalls the first time a place loads (textures made then), a
   that was never written on a fresh build; the runtime's own threads kept off the game's processors.
 - **The launcher** (`scripts/launcher.py`) and the **shake button**.
 - **Speed**: see [Performance](#performance).
+
+## Ideas for later
+
+Picture:
+- **Anti-aliasing**: the game has almost none. Supersampling already works (render at 4K, `resolution_scale = 2.4`,
+  shown at the window's size); a cheaper SMAA / FXAA pass would help weaker GPUs.
+- **Ultrawide (21:9)**: the game's camera aspect ratio patched and its HUD kept in place, instead of black bars.
+- **Draw distance**: the game's level-of-detail distances raised, so far buildings and objects keep their full models.
+- **Sharper shadows**: the shadow maps made at a higher resolution, as the screen's targets already are.
+
+Smoothness:
+- **No first-visit stutter**: every shader and pipeline of the game made at start, not when a kingdom is first entered.
+- **Faster loading**: the loading screens profiled (file reads and decompression look single-threaded).
+- **More headroom**: the render thread's per-draw work ([docs/plan-render-replay.md](docs/plan-render-replay.md)), then
+  the lifter keeping guest registers in C locals (measured on samples: 15-30% less time on the game's threads).
+
+Features:
+- **A mod folder** (LayeredFS): files in a folder override the game's (textures, outfits, other mods).
+- **Photo mode extras**: HUD off on a key, free camera.
+- **Linux / Steam Deck** build.
 
 ## Switches for testing
 
