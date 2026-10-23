@@ -3402,12 +3402,12 @@ static void pass_shot(void) {
     }
     if ((vt->bpb != 4 && !half4) || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { printf("nvn_vk_pass: pass %d: colour format 0x%x not captured\n", n++, (unsigned)t->b.format); return; }
     busy = 1;
-    int w = vt->rs ? t->b.width : vt->w, h = vt->rs ? t->b.height : vt->h, rr[6] = {0, 0, 0, w, h, 1};
+    int tl = target_level(&R.col[0]), w = lvl_(vt->rs ? t->b.width : vt->w, tl), h = lvl_(vt->rs ? t->b.height : vt->h, tl), rr[6] = {0, 0, 0, w, h, 1};      /* the level the pass drew into */
     uint8_t *px = malloc((size_t)w * h * 4);
     int got = 0;
     if (px && half4) {
         uint16_t *hp = malloc((size_t)w * h * 8);
-        if (hp && read_region(t, NULL, rr, hp, 0, 0)) {
+        if (hp && read_region(t, &R.col[0].view, rr, hp, 0, 0)) {
             got = 1;
             long long nan = 0, inf = 0, big = 0;
             for (size_t k = 0; k < (size_t)w * h * 4; k++) { uint16_t hv = hp[k]; if (((hv >> 10) & 31) == 31) { if (hv & 1023) nan++; else inf++; } else if (((hv >> 10) & 31) >= 26) big++; }
@@ -3422,7 +3422,7 @@ static void pass_shot(void) {
         }
         free(hp);
     } else if (px) {
-        got = read_region(t, NULL, rr, px, 0, 0) != 0;
+        got = read_region(t, &R.col[0].view, rr, px, 0, 0) != 0;
         if (got && t->b.format == 0x3f) {          /* B10G11R11 float: an exponent of all ones is infinite or NaN */
             long long bad = 0;
             double mx[3] = {0, 0, 0}, sm[3] = {0, 0, 0};
@@ -3436,7 +3436,7 @@ static void pass_shot(void) {
                     sm[c] += f; if (f > mx[c]) mx[c] = f;
                 }
             }
-            printf("nvn_vk_pass: pass %d: %dx%d R11G11B10F: %lld pixels infinite or NaN; mean %g %g %g, max %g %g %g\n", n, w, h, bad,
+            printf("nvn_vk_pass: pass %d: %dx%d (level %d) R11G11B10F: %lld pixels infinite or NaN; mean %g %g %g, max %g %g %g\n", n, w, h, tl, bad,
                    sm[0] / ((double)w * h), sm[1] / ((double)w * h), sm[2] / ((double)w * h), mx[0], mx[1], mx[2]);
         }
     }
