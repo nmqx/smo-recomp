@@ -46,6 +46,8 @@ static struct {
     VkPhysicalDeviceOpticalFlowFeaturesNV feat;
     VkQueue queue;
     int ready, w, h, gw, gh, flow_init;
+    int fw, fh, reduced; float fs;                   /* the flow is measured on frames of fw x fh (fs = w / fw): reduced = 1 when a smaller copy (cols) is made for it */
+    VkImage cols[OFX_N]; VMem cols_mem[OFX_N]; VkImageView cols_view[OFX_N];
     VkImage col[OFX_N], mid[OFX_N], flow[2];
     VMem col_mem[OFX_N], mid_mem[OFX_N], flow_mem[2], buf_mem[OFX_N];
     VkImageView col_view[OFX_N], mid_view[OFX_N], flow_view[2];
@@ -125,7 +127,7 @@ static const char k_ofx_glsl[] =
     "layout(set = 0, binding = 2, rgba8) uniform writeonly image2D outImg;\n"
     "layout(set = 0, binding = 3, std430) readonly buffer Flow { int v[]; } flow;\n"     /* forward (cur -> prev), then backward (prev -> cur): x low 16 bits, y high, S10.5 */
     "layout(set = 0, binding = 4, std430) buffer Stats { uint n[4]; } stats;\n"
-    "layout(push_constant) uniform Pc { ivec2 size; ivec2 grid; int stats; } pc;\n"
+    "layout(push_constant) uniform Pc { ivec2 size; ivec2 grid; int stats; float fs; } pc;\n"
     "shared uint cnt[3];\n"
     "vec2 fetch(int base, ivec2 c) {\n"
     "    c = clamp(c, ivec2(0), pc.grid - 1);\n"
@@ -133,10 +135,10 @@ static const char k_ofx_glsl[] =
     "    return vec2(float((w << 16) >> 16), float(w >> 16)) * (1.0 / 32.0);\n"
     "}\n"
     "vec2 flowAt(int base, vec2 p) {\n"                 /* bilinear between the centres of the 4x4 cells */
-    "    vec2 g = p * 0.25 - 0.5;\n"
+    "    vec2 g = p / pc.fs * 0.25 - 0.5;\n"
     "    ivec2 c = ivec2(floor(g));\n"
     "    vec2 f = g - vec2(c);\n"
-    "    return mix(mix(fetch(base, c), fetch(base, c + ivec2(1, 0)), f.x), mix(fetch(base, c + ivec2(0, 1)), fetch(base, c + ivec2(1, 1)), f.x), f.y);\n"
+    "    return pc.fs * mix(mix(fetch(base, c), fetch(base, c + ivec2(1, 0)), f.x), mix(fetch(base, c + ivec2(0, 1)), fetch(base, c + ivec2(1, 1)), f.x), f.y);\n"
     "}\n"
     "void main() {\n"
     "    if (gl_LocalInvocationIndex == 0u) { cnt[0] = 0u; cnt[1] = 0u; cnt[2] = 0u; }\n"
@@ -168,7 +170,7 @@ static const char k_ofx_ext_glsl[] =
     "layout(set = 0, binding = 0) uniform sampler2D curTex;\n"
     "layout(set = 0, binding = 1, rgba8) uniform writeonly image2D outImg;\n"
     "layout(set = 0, binding = 2, std430) readonly buffer Flow { int v[]; } flow;\n"
-    "layout(push_constant) uniform Pc { ivec2 size; ivec2 grid; float alpha; } pc;\n"
+    "layout(push_constant) uniform Pc { ivec2 size; ivec2 grid; float alpha; float fs; } pc;\n"
     "vec2 fetch(ivec2 c) {\n"
     "    c = clamp(c, ivec2(0), pc.grid - 1);\n"
     "    int w = flow.v[c.y * pc.grid.x + c.x];\n"
@@ -178,10 +180,10 @@ static const char k_ofx_ext_glsl[] =
     "    ivec2 q = ivec2(gl_GlobalInvocationID.xy);\n"
     "    if (q.x >= pc.size.x || q.y >= pc.size.y) return;\n"
     "    vec2 p = vec2(q) + 0.5;\n"
-    "    vec2 g = p * 0.25 - 0.5;\n"
+    "    vec2 g = p / pc.fs * 0.25 - 0.5;\n"
     "    ivec2 c = ivec2(floor(g));\n"
     "    vec2 f = g - vec2(c);\n"
-    "    vec2 fw = mix(mix(fetch(c), fetch(c + ivec2(1, 0)), f.x), mix(fetch(c + ivec2(0, 1)), fetch(c + ivec2(1, 1)), f.x), f.y);\n"
+    "    vec2 fw = pc.fs * mix(mix(fetch(c), fetch(c + ivec2(1, 0)), f.x), mix(fetch(c + ivec2(0, 1)), fetch(c + ivec2(1, 1)), f.x), f.y);\n"
     "    vec2 d = pc.alpha * fw;\n"
     "    float l = length(d);\n"
     "    if (l > 96.0) d *= 96.0 / l;\n"                 /* a wrong vector far away would tear the picture */
@@ -255,8 +257,8 @@ static void ofx_start(void) {
     {   static const VkDescriptorType mid_types[5] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
                                       ext_types[3] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-        ofx_layout(mid_types, 5, 20, &O.dsl, &O.pl);
-        ofx_layout(ext_types, 3, 20, &O.xdsl, &O.xpl);
+        ofx_layout(mid_types, 5, 24, &O.dsl, &O.pl);
+        ofx_layout(ext_types, 3, 24, &O.xdsl, &O.xpl);
         if (!(O.pipe = ofx_compute(k_ofx_glsl, O.pl)) || !(O.xpipe = ofx_compute(k_ofx_ext_glsl, O.xpl))) return;
     }
     {   const char *e = getenv("SMO_VK_INTERP_EXT"), *m = getenv("SMO_VK_INTERP_EXT_MAX");
@@ -294,6 +296,7 @@ static void ofx_free(void) {
         vkDestroyImageView(V.device, O.col_view[i], NULL); vkDestroyImage(V.device, O.col[i], NULL); vmem_free(O.col_mem[i]);
         vkDestroyImageView(V.device, O.mid_view[i], NULL); vkDestroyImage(V.device, O.mid[i], NULL); vmem_free(O.mid_mem[i]);
         vkDestroyBuffer(V.device, O.buf[i], NULL); vmem_free(O.buf_mem[i]);
+        if (O.reduced) { vkDestroyImageView(V.device, O.cols_view[i], NULL); vkDestroyImage(V.device, O.cols[i], NULL); vmem_free(O.cols_mem[i]); }
     }
     for (int i = 0; i < 2; i++) { vkDestroyImageView(V.device, O.flow_view[i], NULL); vkDestroyImage(V.device, O.flow[i], NULL); vmem_free(O.flow_mem[i]); }
     for (int i = 0; i < 2; i++) { vkDestroyImageView(V.device, O.ext_view[i], NULL); vkDestroyImage(V.device, O.ext[i], NULL); vmem_free(O.ext_mem[i]); }
@@ -321,7 +324,17 @@ static VkImage ofx_image(int w, int h, VkFormat f, VkFlags usage, int concurrent
 }
 /* the images, buffers and sessions for frames of w x h; the colour images and the made frames go to GENERAL (render cmd) */
 static int ofx_make(int w, int h) {
-    O.w = w; O.h = h; O.gw = (w + 3) / 4; O.gh = (h + 3) / 4;
+    {   /* above SMO_VK_INTERP_FLOW_H lines (default 900, the game's own picture) the flow is measured on a copy of that
+         * height: at 2560x1440 the optical flow engine at full size held the graphics queue (which waits for it before
+         * making the frame between) about 5 ms a frame, 60 -> 50 fps in New Donk City. Motion at 4x4 cells of the smaller
+         * copy is as good for the frame between, which is still made at full size. */
+        const char *e = getenv("SMO_VK_INTERP_FLOW_H");
+        int lim = e && atoi(e) >= 180 ? atoi(e) : 900;
+        O.reduced = h > lim;
+        O.fh = O.reduced ? lim : h; O.fw = O.reduced ? (int)((double)w * lim / h + 0.5) : w;
+        O.fs = (float)w / (float)O.fw;
+    }
+    O.w = w; O.h = h; O.gw = (O.fw + 3) / 4; O.gh = (O.fh + 3) / 4;
     for (int i = 0; i < OFX_N; i++) {
         O.col[i] = ofx_image(w, h, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 1, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, &O.col_mem[i], &O.col_view[i]);
         O.mid[i] = ofx_image(w, h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0, 0, &O.mid_mem[i], &O.mid_view[i]);
@@ -335,17 +348,19 @@ static int ofx_make(int w, int h) {
         O.buf_mem[i] = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 7);       /* class 7: blocks of their own (buffers next to optimal images need the granularity) */
         VKC(vkBindBufferMemory(V.device, O.buf[i], O.buf_mem[i].mem, O.buf_mem[i].off));
     }
+    for (int i = 0; O.reduced && i < OFX_N; i++)
+        O.cols[i] = ofx_image(O.fw, O.fh, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, &O.cols_mem[i], &O.cols_view[i]);
     for (int i = 0; i < 2; i++) O.ext[i] = ofx_image(w, h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0, 0, &O.ext_mem[i], &O.ext_view[i]);
     for (int i = 0; i < 2; i++) O.flow[i] = ofx_image(O.gw, O.gh, VK_FORMAT_R16G16_SFIXED5_NV, VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0, VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV, &O.flow_mem[i], &O.flow_view[i]);
     for (int i = 0; i < OFX_N; i++) {
         VkOpticalFlowSessionCreateInfoNV ci = {VK_STRUCTURE_TYPE_OPTICAL_FLOW_SESSION_CREATE_INFO_NV};
-        ci.width = (uint32_t)w; ci.height = (uint32_t)h; ci.imageFormat = VK_FORMAT_B8G8R8A8_UNORM; ci.flowVectorFormat = VK_FORMAT_R16G16_SFIXED5_NV;
+        ci.width = (uint32_t)O.fw; ci.height = (uint32_t)O.fh; ci.imageFormat = VK_FORMAT_B8G8R8A8_UNORM; ci.flowVectorFormat = VK_FORMAT_R16G16_SFIXED5_NV;
         ci.outputGridSize = VK_OPTICAL_FLOW_GRID_SIZE_4X4_BIT_NV; ci.performanceLevel = VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_MEDIUM_NV; ci.flags = VK_OPTICAL_FLOW_SESSION_CREATE_BOTH_DIRECTIONS_BIT_NV;
         VkResult r = vkCreateOpticalFlowSessionNV(V.device, &ci, NULL, &O.session[i]);
         if (r != VK_SUCCESS) { printf("nvn_vk_interp: vkCreateOpticalFlowSessionNV %dx%d: %s: frame interpolation off\n", w, h, vk_result_name(r)); return 0; }
         int p = (i + OFX_N - 1) % OFX_N;
-        VKC(vkBindOpticalFlowSessionImageNV(V.device, O.session[i], VK_OPTICAL_FLOW_SESSION_BINDING_POINT_INPUT_NV, O.col_view[i], VK_IMAGE_LAYOUT_GENERAL));
-        VKC(vkBindOpticalFlowSessionImageNV(V.device, O.session[i], VK_OPTICAL_FLOW_SESSION_BINDING_POINT_REFERENCE_NV, O.col_view[p], VK_IMAGE_LAYOUT_GENERAL));
+        VKC(vkBindOpticalFlowSessionImageNV(V.device, O.session[i], VK_OPTICAL_FLOW_SESSION_BINDING_POINT_INPUT_NV, O.reduced ? O.cols_view[i] : O.col_view[i], VK_IMAGE_LAYOUT_GENERAL));
+        VKC(vkBindOpticalFlowSessionImageNV(V.device, O.session[i], VK_OPTICAL_FLOW_SESSION_BINDING_POINT_REFERENCE_NV, O.reduced ? O.cols_view[p] : O.col_view[p], VK_IMAGE_LAYOUT_GENERAL));
         VKC(vkBindOpticalFlowSessionImageNV(V.device, O.session[i], VK_OPTICAL_FLOW_SESSION_BINDING_POINT_FLOW_VECTOR_NV, O.flow_view[0], VK_IMAGE_LAYOUT_GENERAL));
         VKC(vkBindOpticalFlowSessionImageNV(V.device, O.session[i], VK_OPTICAL_FLOW_SESSION_BINDING_POINT_BACKWARD_FLOW_VECTOR_NV, O.flow_view[1], VK_IMAGE_LAYOUT_GENERAL));
     }
@@ -353,8 +368,9 @@ static int ofx_make(int w, int h) {
     cmd_begin();
     for (int i = 0; i < OFX_N; i++) { image_barrier(O.col[i], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL); image_barrier(O.mid[i], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL); O.slot_flow[i] = 0; }
     for (int i = 0; i < 2; i++) image_barrier(O.ext[i], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    for (int i = 0; O.reduced && i < OFX_N; i++) image_barrier(O.cols[i], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     O.flow_init = 0; O.ready = 1; O.have_prev = 0; O.k = 0;
-    printf("nvn_vk_interp: frames of %dx%d, flow on a %dx%d grid (4x4 pixels a vector, both directions)\n", w, h, O.gw, O.gh);
+    printf("nvn_vk_interp: frames of %dx%d, flow measured on %dx%d (%s), a %dx%d grid (4x4 pixels a vector, both directions)\n", w, h, O.fw, O.fh, O.reduced ? "a smaller copy: SMO_VK_INTERP_FLOW_H" : "the frames themselves", O.gw, O.gh);
     return 1;
 }
 
@@ -498,6 +514,13 @@ static int ofx_present(VTex *vt, const int *s4) {
         b.srcOffsets[0].x = s4[0]; b.srcOffsets[0].y = s4[1]; b.srcOffsets[1].x = s4[0] + w; b.srcOffsets[1].y = s4[1] + h; b.srcOffsets[1].z = 1;
         b.dstOffsets[1].x = w; b.dstOffsets[1].y = h; b.dstOffsets[1].z = 1;
         vkCmdBlitImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, O.col[k], VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+        if (O.reduced) {                              /* the smaller copy the flow is measured on */
+            image_barrier(O.col[k], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+            image_barrier(O.cols[k], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+            b.srcOffsets[0].x = 0; b.srcOffsets[0].y = 0; b.srcOffsets[1].x = w; b.srcOffsets[1].y = h;
+            b.dstOffsets[1].x = O.fw; b.dstOffsets[1].y = O.fh;
+            vkCmdBlitImage(R.cmd, O.col[k], VK_IMAGE_LAYOUT_GENERAL, O.cols[k], VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_LINEAR);
+        }
     }
     uint64_t v = ++O.tl_val;
     O.slot_flow[k] = O.have_prev; O.slot_wait[k] = v;      /* read by the presenter only after the push below (under its lock) */
@@ -516,8 +539,8 @@ static int ofx_present(VTex *vt, const int *s4) {
         wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wr[2].pImageInfo = &ii[2];
         wr[3].descriptorType = wr[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[3].pBufferInfo = &bi[0]; wr[4].pBufferInfo = &bi[1];
         vkCmdPushDescriptorSetKHR(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, O.pl, 0, 5, wr);
-        int pc[5] = {w, h, O.gw, O.gh, O.stats_on};
-        vkCmdPushConstants(R.cmd, O.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        struct { int v[5]; float fs; } pc = {{w, h, O.gw, O.gh, O.stats_on}, O.fs};
+        vkCmdPushConstants(R.cmd, O.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
         vkCmdDispatch(R.cmd, (uint32_t)(w + 15) / 16, (uint32_t)(h + 7) / 8, 1);
         R.pipe_bound = NULL;
         g_sub_tl = O.tl; g_sub_tl_val = v;
@@ -592,7 +615,7 @@ static void ofx_show(VkImage src, uint64_t wait, int ext_slot, float alpha) {
         wr[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wr[1].pImageInfo = &ii[1];
         wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[2].pBufferInfo = &fb;
         vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, O.xpl, 0, 3, wr);
-        struct { int size[2], grid[2]; float alpha; } pc = {{O.w, O.h}, {O.gw, O.gh}, alpha};
+        struct { int size[2], grid[2]; float alpha, fs; } pc = {{O.w, O.h}, {O.gw, O.gh}, alpha, O.fs};
         vkCmdPushConstants(cb, O.xpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
         vkCmdDispatch(cb, (uint32_t)(O.w + 15) / 16, (uint32_t)(O.h + 7) / 8, 1);
         ofx_img_barrier(cb, src, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
