@@ -161,6 +161,8 @@ about 3 minutes on 12 threads, link 1 minute).
   | lifted code at `-O2` (now the default, `RECOMP_OPT`), `RECOMP_ARCH=-march=znver2` | 30-36 |
   | registerSampler_'s free-slot search answered in host code (`smo_fast.c`; the game probes thousands of taken sampler slots per new sampler, each a lifted call: half the main thread's time there) | 38-42 |
   | present without waiting for the replay (`SMO_PRESENT_ASYNC`, now on by default; `=0` waits as before): the game draws the next frame while this one is replayed | 44-54 |
+  | many small cuts in the replay (pipeline, sampler, texture-set and dynamic-state caches, fewer GPU waits) | 54-56 |
+  | vertex and index data read by the GPU in place from the game's heap (`SMO_VK_HOSTMEM`, on by default; `=0` copies it into the stream ring as before): the heap is imported once at start with `VK_EXT_external_memory_host` (3 GB locked in memory), instead of about 17 MB copied a frame | 59-60 |
 
   The runtime is `-O2` too (`RECOMP_HOST_OPT`). `RECOMP_ARCH` (for example `-march=znver2`; add `-mno-prfchw` with
   clang 9 and a recent Windows SDK, whose `winnt.h` clashes with clang 9's `_m_prefetchw`) makes a build for that CPU
@@ -174,7 +176,7 @@ about 3 minutes on 12 threads, link 1 minute).
 Measured with `SMO_HITCH=25` on the same scripted 4-minute route (a new game's opening, Ryzen 5 3600XT, RTX 3090):
 frames that missed the 60 Hz refresh by more than 25 ms, 173 without interpolation, 91 with it (and 78 of those bridged on
 screen by predicted frames). The heaviest places (New Donk City's streets) are still bound by the render thread's replay
-(about 15 ms a frame there) on a 6-core Zen 2.
+(about 11 ms a frame there now) on a 6-core Zen 2.
 
 ## Repository layout
 
