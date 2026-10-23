@@ -4852,10 +4852,11 @@ int nvn_menu_job(UiMenuJob *m) { if (!g_rb->menu) return 0; gl_run(g_rb->menu, m
 
 /* ---- debug labels: kept for every object (nvn_label_get), and given to the OpenGL object where there is one */
 typedef struct LabelEnt { uint64_t key; char text[96]; struct LabelEnt *next; } LabelEnt;
-static LabelEnt *g_labels[1024];
+#define LABEL_N 65536                           /* (1024 buckets whose chains only grew: a finalized object left an empty entry) */
+static LabelEnt *g_labels[LABEL_N];
 static SRWLOCK g_label_lock = SRWLOCK_INIT;
 void nvn_label_set(uint64_t obj, const char *text) {
-    unsigned h = (unsigned)((obj >> 4) * 2654435761u) & 1023;
+    unsigned h = (unsigned)((obj >> 4) * 2654435761u) & (LABEL_N - 1);
     AcquireSRWLockExclusive(&g_label_lock);
     LabelEnt *e = g_labels[h];
     while (e && e->key != obj) e = e->next;
@@ -4864,14 +4865,20 @@ void nvn_label_set(uint64_t obj, const char *text) {
     ReleaseSRWLockExclusive(&g_label_lock);
 }
 const char *nvn_label_get(uint64_t obj) {
-    unsigned h = (unsigned)((obj >> 4) * 2654435761u) & 1023;
+    unsigned h = (unsigned)((obj >> 4) * 2654435761u) & (LABEL_N - 1);
     const char *r = "";
     AcquireSRWLockShared(&g_label_lock);
     for (LabelEnt *e = g_labels[h]; e; e = e->next) if (e->key == obj) r = e->text;
     ReleaseSRWLockShared(&g_label_lock);
     return r;
 }
-void nvn_label_drop(uint64_t obj) { if (nvn_label_get(obj)[0]) nvn_label_set(obj, ""); }
+void nvn_label_drop(uint64_t obj) {                  /* the object is finalized: its entry goes */
+    unsigned h = (unsigned)((obj >> 4) * 2654435761u) & (LABEL_N - 1);
+    AcquireSRWLockExclusive(&g_label_lock);
+    for (LabelEnt **pp = &g_labels[h]; *pp; pp = &(*pp)->next)
+        if ((*pp)->key == obj) { LabelEnt *e = *pp; *pp = e->next; free(e); break; }
+    ReleaseSRWLockExclusive(&g_label_lock);
+}
 static void any_set_label(Ctx *c) {                     /* nvn<Object>SetDebugLabel(object, const char *label) */
     nvn_label_set(A0, A1 ? (const char *)P(A1) : "");
     Tex *t = hobj(A0, K_TEX);

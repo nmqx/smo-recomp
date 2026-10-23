@@ -1711,10 +1711,10 @@ static void resolve_sampler(int s, VStage *v, int i) {
              * default sampler as before. */
             static int zero = -1; static LONG64 n;
             if (zero < 0) zero = !(getenv("SMO_VK_SMP_ZERO") && !atoi(getenv("SMO_VK_SMP_ZERO")));
-            if (zero) { static const SamplerParams z; g_dtex[g_ndtex].smp = sampler_get(&z); }
+            if (zero) { static const SamplerParams z = {1, 1}; g_dtex[g_ndtex].smp = sampler_get(&z); }      /* linear, level 0 only: nearest made the tone mapping's 8x8x8 colour table (also on sampler 0 when the game's sampler table is full) show bands */
             if (n++ < 5 || n % 10000 == 0) printf("nvn_vk: frame %lld, program #%d: a texture handle (unit %u of the %s stage) names sampler %llu, not in the sampler pool: %s (%lld so far)\n",
                                        (long long)nvn_front_frame_next(), R.prog[s] ? R.prog[s]->serial : -1, u, s ? "fragment" : "vertex", (unsigned long long)((handle >> 20) & 0xfff),
-                                       zero ? "a zero sampler (level 0, nearest)" : "the default sampler", (long long)n);
+                                       zero ? "a linear sampler of level 0" : "the default sampler", (long long)n);
         }
     }
     g_ndtex++;
@@ -2960,6 +2960,7 @@ static void vk_draw_quads(uint32_t first, uint32_t count, unsigned type, uint64_
     R.frame_draws++; nvn_front_count(0, 1);
 }
 static void vk_draw_arrays(unsigned prim, uint32_t first, uint32_t count, uint32_t base_inst, uint32_t inst) {
+    if (R.render_off) { g_fr_offskip++; R.frame_skipped++; nvn_front_count(1, 1); return; }      /* a conditional render said no: nothing of the draw is prepared (about 540 draws a frame in New Donk City) */
     if (prim == 7) { vk_draw_quads(first, count, 0, 0, 0, base_inst, inst); return; }
     int gsr = R.prog[2] && g_gs_draws % 20 == 0 && g_gs_draws <= 400 && (gs_dbg_mode() == 1 || gs_dbg_mode() == 3);      /* SMO_VK_GS_DEBUG: gs_dbg_read */
     if (gsr) gs_dbg_read(0);
@@ -2975,6 +2976,7 @@ static void vk_draw_arrays(unsigned prim, uint32_t first, uint32_t count, uint32
     R.frame_draws++; nvn_front_count(0, 1);
 }
 static void vk_draw_elements(unsigned prim, unsigned type, int count, uint64_t indices, int32_t base_vertex, uint32_t base_inst, uint32_t inst) {
+    if (R.render_off) { g_fr_offskip++; R.frame_skipped++; nvn_front_count(1, 1); return; }
     unsigned t = type < 3 ? type : 1;
     if (count <= 0 || !indices) { R.frame_skipped++; nvn_front_count(1, 1); return; }
     if (prim == 7) { vk_draw_quads(0, (uint32_t)count, type, indices, base_vertex, base_inst, inst); return; }
@@ -3133,7 +3135,8 @@ static void exec(const Cmd *m, int depth) {
                 }
                 else { g_occ_cond_waits++; occ_resolve(need); }
             }
-            CB_SYNC(9); int eq = a[2] && rd64(a[2]) == rd64(a[2] + 16); R.render_off = a[1] == 1 ? !eq : eq;
+            CB_SYNC(9);      /* also submits the batch so far: the GPU starts on it while the rest is recorded (made conditional, the GPU waited for whole batches: 46 instead of 59 fps at scale 1.6) */
+            int eq = a[2] && rd64(a[2]) == rd64(a[2] + 16); R.render_off = a[1] == 1 ? !eq : eq;
             g_fr_cond++; g_fr_condoff += R.render_off; g_fr_condhash = (g_fr_condhash ^ (a[2] * 2 + (uint64_t)R.render_off)) * 1099511628211ull;
         }
         break;

@@ -1055,7 +1055,12 @@ static void hid_GetSixAxisSensorState(Ctx *c) {             /* (SixAxisSensorSta
     wr64(o, 5000000);                                        /* delta time, ns */
     wr64(o + 8, (uint64_t)g_six[id].last);                   /* sampling number */
     {   NnPadState ps;                                       /* a pad with a gyro (SDL): its acceleration (G) at +0x10 and angular velocity (revolutions/s) at +0x1c; angle and direction stay at rest */
-        if (sdl_on() && nnpad_get((int)id, &ps) && ps.has_motion) {
+        int got = sdl_on() && nnpad_get((int)id, &ps);
+        if (got && ps.shake) {                               /* [hotkeys] shake_pad held: the pad swung back and forth, 2.5 G one way then the other every 33 ms */
+            int ph = (int)((GetTickCount64() / 33) & 1);
+            float a[3] = {ph ? 2.5f : -2.5f, ph ? 1.5f : -1.5f, -1.0f}, g[3] = {ph ? 2.0f : -2.0f, 0.0f, ph ? 1.0f : -1.0f};
+            memcpy((void *)(uintptr_t)(o + 0x10), a, 12); memcpy((void *)(uintptr_t)(o + 0x1c), g, 12);
+        } else if (got && ps.has_motion) {
             memcpy((void *)(uintptr_t)(o + 0x10), ps.accel, 12); memcpy((void *)(uintptr_t)(o + 0x1c), ps.gyro, 12);
         } else { f = -1.0f; memcpy((void *)(uintptr_t)(o + 0x18), &f, 4); }          /* acceleration z at rest */
     }
@@ -1105,6 +1110,7 @@ static void hid_IsSixAxisSensorAtRest(Ctx *c) {
     if (!(id < 8 || id == 0x10 || id == 0x20) || dev > 2)
         guest_trap("nn::hid::IsSixAxisSensorAtRest with an invalid handle (the hid module refuses it and the SDK aborts, sdk 0x250b9c)", c->x[30] - 4);
     {   NnPadState ps;                                       /* a pad with a gyro: at rest while it turns slower than ~7 degrees/s (NOT VERIFIED: the module's threshold) */
+        if (sdl_on() && id < 8 && nnpad_get((int)id, &ps) && ps.shake) { RET(0); return; }
         if (sdl_on() && id < 8 && nnpad_get((int)id, &ps) && ps.has_motion) { RET(fabsf(ps.gyro[0]) + fabsf(ps.gyro[1]) + fabsf(ps.gyro[2]) < 0.02f); return; }
     }
     RET(1);

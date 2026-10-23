@@ -36,6 +36,7 @@ typedef struct {
     int kb_vk[24];
     int hk_vk;                          /* [hotkeys] amiibo_menu: virtual key, 0 = none */
     unsigned hk_combo;                  /* [hotkeys] amiibo_menu_pad: Pro button bits, 0 = none */
+    unsigned shake_combo;               /* [hotkeys] shake_pad: Pro button bits held to shake the controller, 0 = none */
 } Cfg;
 typedef struct {
     int used, ignored;
@@ -170,6 +171,9 @@ static const char *const g_default_ini =
 "; no combination. Without this section: F1 and STICK_L+STICK_R (both sticks pressed in).\r\n"
 "amiibo_menu = F1\r\n"
 "amiibo_menu_pad = STICK_L+STICK_R\r\n"
+"; Shaking the controller (the cap's spin and homing throws, Cappy's shake moves) for pads without motion sensors: the Pro\r\n"
+"; Controller buttons held for it (those buttons are then not seen by the game); none = no button. Default R (RB / R1).\r\n"
+"shake_pad = R\r\n"
 "\r\n"
 "; Per device (GUID from --pad-test). Every key is optional; what is missing falls back to [general] and the built-in default:\r\n"
 "; [device 03000000de280000ff11000000007801]\r\n"
@@ -198,6 +202,7 @@ static void cfg_defaults(Cfg *c) {
     memcpy(c->kb_vk, g_kb_default, sizeof c->kb_vk);
     c->hk_vk = VK_F1;
     c->hk_combo = 1u << 4 | 1u << 5;                      /* STICK_L + STICK_R */
+    c->shake_combo = 1u << 7;                             /* R (RB / R1): the game has no use for R alone */
 }
 static unsigned parse_combo(char *v) {                    /* "STICK_L+STICK_R" -> Pro button bits; none / unknown names -> 0 */
     unsigned bits = 0;
@@ -302,6 +307,7 @@ static void cfg_parse(Cfg *c, char *text) {
         } else if (sect == 5) {
             if (!_stricmp(key, "amiibo_menu")) c->hk_vk = parse_vk(val);
             else if (!_stricmp(key, "amiibo_menu_pad")) c->hk_combo = _stricmp(val, "none") ? parse_combo(val) : 0;
+            else if (!_stricmp(key, "shake_pad")) c->shake_combo = _stricmp(val, "none") ? parse_combo(val) : 0;
         }
     }
 }
@@ -619,6 +625,7 @@ static void dev_state(const Dev *d, NnPadState *o) {      /* lock held */
     /* SDL's misc1 is the Switch Pro Controller's capture button, the Xbox Series pad's share button, the
      * microphone button of a DualSense: the console's Capture button (nnhid.c takes a picture), not a button the game sees */
     o->capture = d->gp && SDL_GetGamepadButton(d->gp, SDL_GAMEPAD_BUTTON_MISC1);
+    if (g_cfg.shake_combo && (o->buttons & g_cfg.shake_combo) == g_cfg.shake_combo) { o->shake = 1; o->buttons &= ~(uint64_t)g_cfg.shake_combo; }
 }
 static Dev *dev_of(int player) { for (int i = 0; i < MAXDEV; i++) if (g_dev[i].used && !g_dev[i].ignored && g_dev[i].slot == player) return &g_dev[i]; return NULL; }
 

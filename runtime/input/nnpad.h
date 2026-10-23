@@ -13,6 +13,7 @@ typedef struct {
     float accel[3];             /* in G, Nintendo axes (see nnpad_sdl.c; the frame is NOT VERIFIED against a console) */
     float gyro[3];              /* in revolutions per second, same axes */
     int capture;                /* the pad's share / capture button (SDL misc1) is down: the console's Capture button, not seen by the game */
+    int shake;                  /* the [hotkeys] shake_pad buttons are held: the controller is shaken (nnhid.c), those buttons are not seen by the game */
 } NnPadState;
 
 int  nnpad_init(void);                           /* SDL up (no video, no window); 0 = failed. Also loads controllers.ini. */
