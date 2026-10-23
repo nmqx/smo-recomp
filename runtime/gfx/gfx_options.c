@@ -98,7 +98,8 @@ static const char *const k_default_ini =
 ";   frame / N apart: 60 N a second (3: 180, 4: 240); each frame of the game is shown (N - 1) / N of a frame later.\r\n"
 ";   Worth it only up to the display's refresh rate: above it the pictures the display has no time for are dropped.\r\n"
 ";   display: one picture per refresh of the display (a 144 or 165 Hz monitor too, not a multiple of 60), each made\r\n"
-";   at the place in time between the game's two frames where that refresh falls; about a frame later than the game.\r\n"
+";   at the place in time between the game's two frames where that refresh falls. Each frame of the\r\n"
+";   game is shown 1 to 2 frames later (x2: half a frame): the next one must be there to make the pictures before it.\r\n"
 ";   SMO_VK_INTERP_MULT=<n> | display wins.\r\n"
 "frame_interpolation_multiplier = 2\r\n";
 

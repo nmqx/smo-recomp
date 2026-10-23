@@ -4,6 +4,9 @@
  * xN (graphics.ini frame_interpolation_multiplier = N, 2..6; SMO_VK_INTERP_MULT=N wins; O.mult): N - 1 frames are made
  * between two of the game's, at 1/N, 2/N, ... of the way (O.nmid of them), and every picture is shown a step (a game
  * frame / N) after the one before: 60 N a second. Below, "halfway" and "half a game frame" are x2's step.
+ * display (frame_interpolation_multiplier = display, SMO_VK_INTERP_MULT=display; O.disp): one picture per refresh of the
+ * display, at any rate (164 Hz: 2.73 a game frame), made by the presenter itself at the alpha where that refresh falls
+ * (ofx_thread_display); the render thread then makes no frame (nmid = 0), it only copies and measures.
  *
  * graphics.ini frame_interpolation = optical_flow; SMO_VK_INTERP=1 / 0 wins. Off when the GPU has no VK_NV_optical_flow,
  * no queue family with optical flow and transfer, or no push descriptors (said in the log).
@@ -41,13 +44,16 @@ static PFN_vkBindOpticalFlowSessionImageNV vkBindOpticalFlowSessionImageNV;
 static PFN_vkCmdOpticalFlowExecuteNV vkCmdOpticalFlowExecuteNV;
 static PFN_vkCmdPipelineBarrier2 vkCmdPipelineBarrier2;
 static PFN_vkWaitSemaphores vkWaitSemaphores;
+static PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue;
 
 /* made: 0 = a frame of the game, j = the j-th frame made between (alpha j / mult); delay: shown a step (period / mult)
  * after the picture before it, else as soon as the GPU has it */
-typedef struct { VkImage img; uint64_t wait; int made, delay, slot; } OfxItem;
+typedef struct { VkImage img; uint64_t wait; int made, delay, slot; LONG64 t; } OfxItem;     /* t: when the render thread gave it (display) */
 static struct {
     int want, on, failed;
     int mult, nmid;                                 /* pictures per game frame (2..6) and frames made per game frame (mult - 1) */
+    int disp, held;                                 /* display: one picture per refresh (mult 2 for the defaults, nmid 0); frames the presenter keeps */
+    double d_lag;                                   /* display: how far behind the newest frame the pictures are, game frames (the presenter's, for the log) */
     uint32_t family;                                /* the queue family with optical flow (and transfer) */
     VkDeviceQueueCreateInfo qi[2];
     float prio, gprio[2];
@@ -233,6 +239,7 @@ static void ofx_layout(const VkDescriptorType *types, int n, uint32_t pc_size, V
     VKC(vkCreatePipelineLayout(V.device, &pli, NULL, pl));
 }
 static DWORD WINAPI ofx_thread(void *arg);
+static DWORD WINAPI ofx_thread_display(void *arg);
 /* after the device exists (vkd_init): functions, queue, command pools, sync objects, the compute stage, the presenter */
 static void ofx_start(void) {
     if (!O.want) return;
@@ -240,6 +247,7 @@ static void ofx_start(void) {
     if (!D.has_push) { printf("nvn_vk_interp: no push descriptors (VK_KHR_push_descriptor): frame interpolation off\n"); return; }
 #define G(n) if (!(n = (PFN_##n)vkGetDeviceProcAddr(V.device, #n))) { printf("nvn_vk_interp: the device has no %s: frame interpolation off\n", #n); return; }
     G(vkCreateOpticalFlowSessionNV) G(vkDestroyOpticalFlowSessionNV) G(vkBindOpticalFlowSessionImageNV) G(vkCmdOpticalFlowExecuteNV) G(vkCmdPipelineBarrier2) G(vkWaitSemaphores)
+    G(vkGetSemaphoreCounterValue)
 #undef G
     vkGetDeviceQueue(V.device, O.family, 0, &O.queue);
     if (O.qi[0].queueCount >= 2) vkGetDeviceQueue(V.device, V.family, 1, &O.pqueue); else O.pqueue = V.queue;
@@ -276,9 +284,11 @@ static void ofx_start(void) {
         if (!(O.pipe = ofx_compute(k_ofx_glsl, O.pl)) || !(O.xpipe = ofx_compute(k_ofx_ext_glsl, O.xpl))) return;
     }
     {   const char *e = getenv("SMO_VK_INTERP_MULT");
-        int n = e && e[0] ? atoi(e) : gfx_options()->interp_mult;
-        if (n < 2 || n > OFX_MID + 1) { if (n) printf("nvn_vk_interp: a multiplier of %d is not 2..%d: x2\n", n, OFX_MID + 1); n = 2; }
-        O.mult = n; O.nmid = n - 1;
+        int n = e && e[0] ? (!_stricmp(e, "display") ? 0 : atoi(e) ? atoi(e) : -1) : gfx_options()->interp_mult;
+        O.disp = n == 0;
+        if (O.disp) n = 2;                          /* the extrapolation's defaults are x2's */
+        if (n < 2 || n > OFX_MID + 1) { printf("nvn_vk_interp: a multiplier of %d is not 2..%d or display: x2\n", n, OFX_MID + 1); n = 2; }
+        O.mult = n; O.nmid = O.disp ? 0 : n - 1;
     }
     {   const char *e = getenv("SMO_VK_INTERP_EXT"), *m = getenv("SMO_VK_INTERP_EXT_MAX");
         O.ext_on = !(e && e[0] && atoi(e) == 0);
@@ -289,10 +299,15 @@ static void ofx_start(void) {
     O.stats_on = getenv("SMO_VK_INTERP_STATS") && atoi(getenv("SMO_VK_INTERP_STATS"));
     O.period = 1000.0 / 60.0;
     InitializeCriticalSection(&O.lock); InitializeConditionVariable(&O.cv); InitializeConditionVariable(&O.idle_cv);
-    O.thread = CreateThread(NULL, 0, ofx_thread, NULL, 0, NULL);
+    O.thread = CreateThread(NULL, 0, O.disp ? ofx_thread_display : ofx_thread, NULL, 0, NULL);
     SetThreadPriority(O.thread, THREAD_PRIORITY_HIGHEST);
     O.on = 1;
     static const char *const k_frac[OFX_MID] = {"half", "third of a", "quarter of a", "fifth of a", "sixth of a"};
+    if (O.disp)
+        printf("nvn_vk_interp: ON, display: one picture per refresh of the display, made by the presenter between two of the game's frames (optical flow engine: queue family %u) "
+               "where the refresh falls (frame_interpolation_multiplier / SMO_VK_INTERP_MULT; SMO_VK_INTERP_LAG=<game frames> / SMO_VK_INTERP_LEAD=<ms> / SMO_VK_INTERP_HZ=<rate>); "
+               "a late frame of the game is bridged by predictions up to %.1f game frames ahead (%s)\n", (unsigned)O.family, O.ext_max * 0.5, O.ext_on ? "on" : "OFF");
+    else
     printf("nvn_vk_interp: ON, x%d: %d frame%s made by the optical flow engine (queue family %u) between two of the game's, a %s game frame apart: %d frames a second "
            "(frame_interpolation_multiplier / SMO_VK_INTERP_MULT); a late frame of the game is bridged by up to %d frames predicted from the one before (%s; SMO_VK_INTERP_EXT=0 / SMO_VK_INTERP_EXT_MAX=<n>)\n",
            O.mult, O.nmid, O.nmid > 1 ? "s" : "", (unsigned)O.family, k_frac[O.mult - 2], 60 * O.mult, O.ext_max, O.ext_on ? "on" : "OFF");
@@ -302,7 +317,8 @@ static void ofx_drain(void) {                       /* render thread: until the 
     if (!O.thread) return;
     EnterCriticalSection(&O.lock);
     O.no_ext = 1;                                   /* and predicts nothing until the next frame it is given */
-    while (O.qn || O.busy) SleepConditionVariableCS(&O.idle_cv, &O.lock, 100);
+    WakeAllConditionVariable(&O.cv);                /* display: the presenter gives back the frames it keeps (held) */
+    while (O.qn || O.busy || O.held) SleepConditionVariableCS(&O.idle_cv, &O.lock, 100);
     LeaveCriticalSection(&O.lock);
 }
 static void ofx_free(void) {
@@ -401,7 +417,7 @@ static int ofx_make(int w, int h) {
 static void ofx_push(VkImage img, uint64_t wait, int made, int delay, int slot) {
     EnterCriticalSection(&O.lock);
     while (O.qn == OFX_Q) SleepConditionVariableCS(&O.idle_cv, &O.lock, 100);
-    O.q[(O.qh + O.qn) % OFX_Q] = (OfxItem){img, wait, made, delay, slot};
+    O.q[(O.qh + O.qn) % OFX_Q] = (OfxItem){img, wait, made, delay, slot, tk()};
     O.qn++; O.slot_items[slot]++;
     O.no_ext = 0;
     WakeAllConditionVariable(&O.cv);
@@ -618,8 +634,9 @@ static void ofx_img_barrier(VkCommandBuffer cb, VkImage img, VkFlags ss, VkFlags
     b.srcAccessMask = sa; b.dstAccessMask = da; b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     vkCmdPipelineBarrier(cb, ss, ds, 0, 0, NULL, 0, NULL, 1, &b);
 }
-/* presenter: shows src, or (ext_slot >= 0) the frame of that slot moved on by alpha game frames, made here first */
-static void ofx_show(VkImage src, uint64_t wait, int ext_slot, float alpha) {
+/* presenter: shows src, or (ext_slot >= 0) the frame of that slot moved on by alpha game frames, or (prev_slot >= 0 too,
+ * display) the frame at alpha between prev_slot's and ext_slot's, made here first */
+static void ofx_show(VkImage src, uint64_t wait, int ext_slot, float alpha, int prev_slot) {
     static int ext_i;
     int i = O.p_i;
     O.p_i = (i + 1) % 4;
@@ -637,18 +654,33 @@ static void ofx_show(VkImage src, uint64_t wait, int ext_slot, float alpha) {
     if (ext_slot >= 0) {
         src = O.ext[ext_i]; ext_i ^= 1;
         ofx_img_barrier(cb, src, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, O.xpipe);
-        VkDescriptorImageInfo ii[2] = {{O.smp, O.col_view[ext_slot], VK_IMAGE_LAYOUT_GENERAL}, {NULL, O.ext_view[ext_i ^ 1], VK_IMAGE_LAYOUT_GENERAL}};
-        VkDescriptorBufferInfo fb = {O.buf[ext_slot], 0, VK_WHOLE_SIZE};
-        VkWriteDescriptorSet wr[3];
-        memset(wr, 0, sizeof wr);
-        for (int n = 0; n < 3; n++) { wr[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[n].dstBinding = (uint32_t)n; wr[n].descriptorCount = 1; }
-        wr[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr[0].pImageInfo = &ii[0];
-        wr[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wr[1].pImageInfo = &ii[1];
-        wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[2].pBufferInfo = &fb;
-        vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, O.xpl, 0, 3, wr);
-        struct { int size[2], grid[2]; float alpha, fs; } pc = {{O.w, O.h}, {O.gw, O.gh}, alpha, O.fs};
-        vkCmdPushConstants(cb, O.xpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        if (prev_slot >= 0) {                       /* k_ofx_glsl as the render thread's, into ext[] */
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, O.pipe);
+            VkDescriptorImageInfo ii[3] = {{O.smp, O.col_view[prev_slot], VK_IMAGE_LAYOUT_GENERAL}, {O.smp, O.col_view[ext_slot], VK_IMAGE_LAYOUT_GENERAL}, {NULL, O.ext_view[ext_i ^ 1], VK_IMAGE_LAYOUT_GENERAL}};
+            VkDescriptorBufferInfo bb[2] = {{O.buf[ext_slot], 0, VK_WHOLE_SIZE}, {O.stats, 0, VK_WHOLE_SIZE}};
+            VkWriteDescriptorSet wr[5];
+            memset(wr, 0, sizeof wr);
+            for (int n = 0; n < 5; n++) { wr[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[n].dstBinding = (uint32_t)n; wr[n].descriptorCount = 1; }
+            wr[0].descriptorType = wr[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr[0].pImageInfo = &ii[0]; wr[1].pImageInfo = &ii[1];
+            wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wr[2].pImageInfo = &ii[2];
+            wr[3].descriptorType = wr[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[3].pBufferInfo = &bb[0]; wr[4].pBufferInfo = &bb[1];
+            vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, O.pl, 0, 5, wr);
+            struct { int v[5]; float fs, alpha; } pc = {{O.w, O.h, O.gw, O.gh, O.stats_on}, O.fs, alpha};
+            vkCmdPushConstants(cb, O.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        } else {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, O.xpipe);
+            VkDescriptorImageInfo ii[2] = {{O.smp, O.col_view[ext_slot], VK_IMAGE_LAYOUT_GENERAL}, {NULL, O.ext_view[ext_i ^ 1], VK_IMAGE_LAYOUT_GENERAL}};
+            VkDescriptorBufferInfo fb = {O.buf[ext_slot], 0, VK_WHOLE_SIZE};
+            VkWriteDescriptorSet wr[3];
+            memset(wr, 0, sizeof wr);
+            for (int n = 0; n < 3; n++) { wr[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[n].dstBinding = (uint32_t)n; wr[n].descriptorCount = 1; }
+            wr[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr[0].pImageInfo = &ii[0];
+            wr[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wr[1].pImageInfo = &ii[1];
+            wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[2].pBufferInfo = &fb;
+            vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, O.xpl, 0, 3, wr);
+            struct { int size[2], grid[2]; float alpha, fs; } pc = {{O.w, O.h}, {O.gw, O.gh}, alpha, O.fs};
+            vkCmdPushConstants(cb, O.xpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        }
         vkCmdDispatch(cb, (uint32_t)(O.w + 15) / 16, (uint32_t)(O.h + 7) / 8, 1);
         ofx_img_barrier(cb, src, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     }
@@ -670,7 +702,7 @@ static void ofx_show(VkImage src, uint64_t wait, int ext_slot, float alpha) {
     uint64_t pv = O.pval + 1;
     VkSemaphore waits[2] = {acq, O.tl}, sigs[2] = {O.p_rend[index & 15], O.ptl};
     uint64_t wv[2] = {0, wait}, sv[2] = {0, pv};
-    VkFlags stages[2] = {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT};
+    VkFlags stages[2] = {VK_PIPELINE_STAGE_TRANSFER_BIT, ext_slot >= 0 ? VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT};   /* display: the frames may still be in the making */
     VkTimelineSemaphoreSubmitInfo tsi = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
     tsi.waitSemaphoreValueCount = 2; tsi.pWaitSemaphoreValues = wv; tsi.signalSemaphoreValueCount = 2; tsi.pSignalSemaphoreValues = sv;
     VkSubmitInfo sb = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -723,7 +755,7 @@ static DWORD WINAPI ofx_thread(void *arg) {
         if (ext) {
             n_ext++; run++;
             if (n_ext == 1) InterlockedIncrement64(&O.ext_runs);
-            if (!O.swap_bad) { ofx_show(NULL, it.wait, it.slot, (float)n_ext / (float)O.mult); InterlockedIncrement64(&O.ext_shown); }
+            if (!O.swap_bad) { ofx_show(NULL, it.wait, it.slot, (float)n_ext / (float)O.mult, -1); InterlockedIncrement64(&O.ext_shown); }
             last = tk();
         } else if (it.made && it.made <= n_ext) {   /* a made frame from before the predictions (a frame of the game without flow after them is shown) */
             InterlockedIncrement64(&O.mid_dropped);
@@ -736,7 +768,7 @@ static DWORD WINAPI ofx_thread(void *arg) {
                 if (tk() > due + fq.QuadPart / 500) InterlockedIncrement64(&O.late);
                 ofx_wait_until(due);
             }
-            if (!O.swap_bad) ofx_show(it.img, it.wait, -1, 0.0f); else InterlockedIncrement64(&O.skipped);
+            if (!O.swap_bad) ofx_show(it.img, it.wait, -1, 0.0f, -1); else InterlockedIncrement64(&O.skipped);
             last = tk();
             if (!it.made) { last_slot = it.slot; if (run > O.ext_longest) O.ext_longest = run; n_ext = 0; run = 0; }      /* a frame of the game */
         }
@@ -744,6 +776,160 @@ static DWORD WINAPI ofx_thread(void *arg) {
         O.p_used[it.slot] = O.pval;
         O.slot_items[it.slot]--;
         O.busy = 0;
+        WakeAllConditionVariable(&O.idle_cv);
+        LeaveCriticalSection(&O.lock);
+    }
+    return 0;
+}
+
+/* ---- display (frame_interpolation_multiplier = display): one picture per refresh of the display, at any rate. The render
+ * thread copies the game's frames and measures their flow as always but makes no frame (nmid = 0); the presenter keeps the
+ * newest few (fr[]: their slot_items stay counted until it gives them back, so ofx_wait_slot holds their slots) and, a lead
+ * (half a refresh; SMO_VK_INTERP_LEAD=<ms>) before each vertical blank of DWM's timing, makes the picture of the playhead s
+ * (in game frames: frame n is s = n) with k_ofx_glsl between the two frames around it, at alpha = s - floor(s). s goes on
+ * by refresh / game period each refresh and is pulled gently (5% a refresh; a jump when more than a game frame off) toward
+ * lag game frames behind the newest frame's arrival, the render thread's tk() at its push: lag must cover the GPU's time
+ * for that frame (its drawing, copy and flow) so that it is ready when the playhead first needs it. It starts at 1.5,
+ * shrinks slowly while the frames are ready in time and grows by 0.15 when one is not (SMO_VK_INTERP_LAG=<frames> fixes
+ * it). Past the newest frame (the game's next one is late) the newest is moved on along its own motion (k_ofx_ext_glsl),
+ * up to ext_max / 2 game frames as at x2, then held. A frame without flow (after a gap) starts over from it. */
+#include <dwmapi.h>
+typedef HRESULT (WINAPI *OfxDwmTiming)(HWND, DWM_TIMING_INFO *);
+/* the display's refresh period and a vertical blank, QPC ticks: DWM's (dwmapi.dll loaded here: nothing else links it),
+ * else the primary monitor's rate (no phase); SMO_VK_INTERP_HZ=<rate> sets the rate */
+static void ofx_vblank(LONG64 fq, LONG64 *period, LONG64 *vblank) {
+    static OfxDwmTiming dwm;
+    static int tried;
+    static double hz_env = -1.0;
+    if (!tried) {
+        HMODULE m = LoadLibraryA("dwmapi.dll");
+        const char *e = getenv("SMO_VK_INTERP_HZ");
+        dwm = m ? (OfxDwmTiming)(void *)GetProcAddress(m, "DwmGetCompositionTimingInfo") : NULL;
+        hz_env = e && atof(e) >= 24.0 ? atof(e) : 0.0;
+        tried = 1;
+    }
+    DWM_TIMING_INFO ti;
+    memset(&ti, 0, sizeof ti); ti.cbSize = sizeof ti;
+    if (dwm && dwm(NULL, &ti) == S_OK && ti.qpcRefreshPeriod > 0) { *period = (LONG64)ti.qpcRefreshPeriod; *vblank = (LONG64)ti.qpcVBlank; }
+    else {
+        DEVMODEA dm;
+        memset(&dm, 0, sizeof dm); dm.dmSize = sizeof dm;
+        int hz = EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1 ? (int)dm.dmDisplayFrequency : 60;
+        *period = fq / hz; *vblank = 0;
+    }
+    if (hz_env > 0.0) *period = (LONG64)((double)fq / hz_env);
+}
+typedef struct { int slot, flow; uint64_t wait; LONG64 t, n; } OfxHeld;
+static void ofx_give_back(int slot) { O.p_used[slot] = O.pval; O.slot_items[slot]--; }     /* under O.lock: every submission so far may have read it */
+static DWORD WINAPI ofx_thread_display(void *arg) {
+    (void)arg;
+    OfxHeld fr[OFX_N];
+    int nf = 0, have_s = 0, fixed_lag, run = 0, held_shown = 0;
+    LONG64 seq = 0, rp = 0, vb = 0, prev_tick = 0, ticks = 0, shown_n = -1;
+    double s = 0.0, lag, lead_ms, lim = O.ext_on ? O.ext_max * 0.5 : 0.0;
+    LARGE_INTEGER fqi;
+    QueryPerformanceFrequency(&fqi);
+    LONG64 fq = fqi.QuadPart, spin = fq / 500;      /* the last 2 ms before a tick: ofx_wait_until, outside the lock */
+    os_pin_host_thread();
+    {   const char *e = getenv("SMO_VK_INTERP_LAG"), *l = getenv("SMO_VK_INTERP_LEAD");
+        fixed_lag = e && atof(e) > 0.0;
+        lag = fixed_lag ? atof(e) : 1.5;
+        lead_ms = l && atof(l) > 0.0 ? atof(l) : 0.0;
+    }
+    for (;;) {
+        if (ticks++ % 32 == 0) ofx_vblank(fq, &rp, &vb);
+        LONG64 lead = lead_ms > 0.0 ? (LONG64)(lead_ms * (double)fq / 1000.0) : rp / 2, now = tk();
+        LONG64 x = now + lead - vb, t = vb + (x >= 0 ? x / rp + 1 : 0) * rp - lead;
+        while (t < prev_tick + rp / 2) t += rp;     /* one picture a refresh */
+        int stale = 0;
+        EnterCriticalSection(&O.lock);
+        for (;;) {
+            if (O.stop) break;
+            if (O.no_ext) {                         /* ofx_drain: the render thread presents on its own; all is given back */
+                for (int i = 0; i < nf; i++) ofx_give_back(fr[i].slot);
+                while (O.qn) { ofx_give_back(O.q[O.qh].slot); O.qh = (O.qh + 1) % OFX_Q; O.qn--; }
+                nf = 0; O.held = 0; have_s = 0; shown_n = -1;
+                WakeAllConditionVariable(&O.idle_cv);
+                SleepConditionVariableCS(&O.cv, &O.lock, 100);
+                stale = 1;
+                break;
+            }
+            LONG64 n2 = tk();
+            if (n2 >= t - spin) break;
+            DWORD ms = (DWORD)((double)(t - spin - n2) * 1000.0 / (double)fq);
+            SleepConditionVariableCS(&O.cv, &O.lock, ms ? ms : 1);
+        }
+        if (O.stop) {
+            for (int i = 0; i < nf; i++) ofx_give_back(fr[i].slot);
+            nf = 0; O.held = 0;
+            WakeAllConditionVariable(&O.idle_cv);
+            LeaveCriticalSection(&O.lock);
+            break;
+        }
+        LeaveCriticalSection(&O.lock);
+        if (stale) continue;
+        ofx_wait_until(t);
+        EnterCriticalSection(&O.lock);
+        if (O.stop || O.no_ext) { LeaveCriticalSection(&O.lock); continue; }       /* handled above, next round */
+        prev_tick = t;
+        while (O.qn) {                              /* the frames given since the last refresh */
+            OfxItem it = O.q[O.qh];
+            O.qh = (O.qh + 1) % OFX_Q; O.qn--;
+            int flow = O.slot_flow[it.slot];        /* still its frame's: the slot is counted (slot_items) */
+            if (!flow) { for (int i = 0; i < nf; i++) ofx_give_back(fr[i].slot); nf = 0; have_s = 0; }      /* not the neighbour of the one before */
+            if (nf == OFX_N - 1) { ofx_give_back(fr[0].slot); memmove(fr, fr + 1, sizeof fr[0] * (size_t)(nf - 1)); nf--; }   /* the render thread's next slot stays free */
+            fr[nf].slot = it.slot; fr[nf].flow = flow; fr[nf].wait = it.wait; fr[nf].t = it.t; fr[nf].n = ++seq;
+            nf++;
+        }
+        O.held = nf;
+        if (!nf || O.swap_bad) { WakeAllConditionVariable(&O.idle_cv); LeaveCriticalSection(&O.lock); continue; }
+        /* the playhead, for the picture shown at the coming vertical blank t + lead */
+        double per = O.period * (double)fq / 1000.0;
+        OfxHeld *nw = &fr[nf - 1];
+        double target = (double)nw->n + (double)(t + lead - nw->t) / per - lag;
+        if (!have_s) { s = target; have_s = 1; }
+        else { s += (double)rp / per; double e = target - s; s += e > 1.0 || e < -1.0 ? e : 0.05 * e; }
+        if (s < (double)fr[0].n) s = (double)fr[0].n;
+        int hold = s > (double)nw->n + lim;
+        if (hold) s = (double)nw->n + lim;
+        VkImage src = NULL;
+        int ext_slot = -1, prev_slot = -1, skip = 0;
+        float alpha = 0.0f;
+        uint64_t wait;
+        LONG64 pn = -1;                             /* a frame of the game shown as it is */
+        if (s >= (double)nw->n) {                   /* at or past the newest frame */
+            double e = s - (double)nw->n;
+            if (e >= 1.0 / 128.0 && nw->flow && O.ext_on) { ext_slot = nw->slot; alpha = (float)e; skip = hold && held_shown; }
+            else { pn = nw->n; src = O.col[nw->slot]; }
+            wait = nw->wait;
+        } else {
+            LONG64 i0 = (LONG64)floor(s);
+            OfxHeld *f0 = &fr[i0 - fr[0].n], *f1 = f0 + 1;
+            double a = s - (double)i0;
+            if (f1->flow && a >= 1.0 / 128.0 && a <= 1.0 - 1.0 / 128.0) { prev_slot = f0->slot; ext_slot = f1->slot; alpha = (float)a; wait = f1->wait; }
+            else { OfxHeld *g = a < 0.5 ? f0 : f1; pn = g->n; src = O.col[g->slot]; wait = g->wait; }
+        }
+        if (pn >= 0 && pn == shown_n) skip = 1;     /* the same picture as at the refresh before */
+        O.busy = !skip;
+        LeaveCriticalSection(&O.lock);
+        if (!skip) {
+            uint64_t have = 0;
+            vkGetSemaphoreCounterValue(V.device, O.tl, &have);
+            if (have < wait) {                      /* not ready on the GPU in time: a later picture from now on */
+                InterlockedIncrement64(&O.late);
+                if (!fixed_lag) lag = lag + 0.15 > 1.9 ? 1.9 : lag + 0.15;
+            } else if (!fixed_lag) lag = lag - 0.00005 < 1.05 ? 1.05 : lag - 0.00005;
+            O.d_lag = lag;
+            ofx_show(src, wait, ext_slot, alpha, prev_slot);
+            if (prev_slot >= 0) InterlockedIncrement64(&O.made);
+            if (prev_slot < 0 && ext_slot >= 0) { InterlockedIncrement64(&O.ext_shown); if (!run++) InterlockedIncrement64(&O.ext_runs); }
+            else { if (run > O.ext_longest) O.ext_longest = run; run = 0; }
+            shown_n = pn; held_shown = hold && ext_slot >= 0;
+        }
+        EnterCriticalSection(&O.lock);
+        O.busy = 0;
+        while (nf > 1 && (double)fr[0].n < floor(s)) { ofx_give_back(fr[0].slot); memmove(fr, fr + 1, sizeof fr[0] * (size_t)(nf - 1)); nf--; }   /* before the playhead: no longer read */
+        O.held = nf;
         WakeAllConditionVariable(&O.idle_cv);
         LeaveCriticalSection(&O.lock);
     }
@@ -763,6 +949,7 @@ static void ofx_stop(void) {
            (long long)O.made, (long long)O.shown, (long long)O.late, (long long)O.skipped);
     printf("nvn_vk_interp: late frames of the game bridged %lld times by %lld predicted frames (longest run %lld); made frames left out after a prediction: %lld\n",
            (long long)O.ext_runs, (long long)O.ext_shown, (long long)O.ext_longest, (long long)O.mid_dropped);
+    if (O.disp) printf("nvn_vk_interp: display: the pictures were %.2f game frames behind the newest frame at the end; \"late by more than 2 ms\" above = pictures whose frame was not ready on the GPU at their refresh\n", O.d_lag);
     {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         printf("nvn_vk_interp: the render thread waited for slots %.0f ms in all, longest %.1f ms; the presenter has %s\n", (double)g_ofx_wait_tk * 1000.0 / (double)fq.QuadPart,
                (double)g_ofx_wait_max * 1000.0 / (double)fq.QuadPart, O.pqueue != V.queue ? "a queue of its own" : "the render thread's queue (shared under a lock)");
